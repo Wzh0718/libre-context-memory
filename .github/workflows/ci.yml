@@ -1,0 +1,99 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # 1) 测试：核心 / 会话存活 / 适配器契约
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: 语法检查
+        run: |
+          for f in core/*.mjs scripts/*.mjs adapters/dsh/src/*.js adapters/dsh/test/*.js; do
+            node --check "$f"
+          done
+
+      - name: 核心测试（压缩/存储/卫生/恢复）
+        run: node --test core/test/*.test.mjs
+
+      - name: 会话存活回放（无 DSH 源码时自动跳过）
+        run: node --test scripts/replay-session-survival.test.mjs
+
+      - name: 适配器契约测试
+        working-directory: adapters/dsh
+        run: node --test test/*.test.js
+
+  # 2) 打包：自包含包（含 core）+ 包内自检 + 上传产物
+  package:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 组装自包含包（内含 core，引用已改写，包内测试就地验证）
+        run: node scripts/build-package.mjs
+
+      - name: 校验 tarball 可被安装并加载（模拟 DSH 的 node_modules 装载）
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/verify && cd /tmp/verify
+          npm init -y >/dev/null
+          npm install "$GITHUB_WORKSPACE"/dist/dsh-lcm-*.tgz >/dev/null
+          node --input-type=module -e "
+            const m = await import('dsh-lcm')
+            const hooks = []
+            m.apply({ on: (e) => hooks.push(e), get: () => undefined, logger: { info(){}, warn(){} } }, { mode: 'shadow' })
+            const want = ['tools/post-execute', 'agent/pre-step', 'session/event', 'system-prompt/assemble']
+            for (const w of want) if (!hooks.includes(w)) throw new Error('缺少钩子 ' + w)
+            console.log('✅ 包可加载，四条臂已注册:', hooks.join(', '))
+          "
+          node -e "
+            const p = require('/tmp/verify/node_modules/dsh-lcm/package.json')
+            if (!p.dsh?.bundle?.patch) throw new Error('缺少 dsh.bundle.patch 装载契约')
+            console.log('✅ dsh 装载契约:', p.dsh.bundle.patch, '| 兼容范围:', p.dsh.compatibility?.dsh)
+          "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-lcm-tarball
+          path: dist/*.tgz
+          if-no-files-found: error
+
+  # 3) 发版：打 tag 时创建 Release 并附上 tarball
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 用 tag 版本号重新打包
+        run: node scripts/build-package.mjs "${GITHUB_REF_NAME#v}"
+
+      - name: 创建 Release 并上传 tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/dsh-lcm-*.tgz --title "$GITHUB_REF_NAME" --generate-notes

@@ -194,11 +194,23 @@ node core/cli.mjs report                        # 五段账本：缓存/静态�
 node core/cli.mjs sweep                         # 手动执行存储清扫
 ```
 
-**装进 DSH**：
+**装进 DSH**（三选一，均为追加式安装，`remove` 即回滚）：
 
 ```bash
-dsh plugin --profile web add link:$(pwd)/adapters/dsh   # 追加式安装，remove 即回滚
+# ① 从发版包安装（推荐）：CI 产出的自包含 tarball，已内含 core，无需本仓库在场
+dsh plugin --profile web add https://github.com/Wzh0718/libre-context-memory/releases/latest/download/dsh-lcm-0.1.0.tgz
+
+# ② 从源码 link 安装（开发用，改代码即时生效）
+dsh plugin --profile web add link:$(pwd)/adapters/dsh
+
+# ③ 本地构建 tarball 再装
+node scripts/build-package.mjs                              # 产出 dist/dsh-lcm-<version>.tgz
+dsh plugin --profile web add dist/dsh-lcm-0.1.0.tgz
 ```
+
+**自包含打包**：`scripts/build-package.mjs` 把 `core/*.mjs` 一起打进包里并把引用改写成包内相对路径，
+然后在**打包产物上就地跑契约测试**——构建产物自身可用才算通过（CI 里还会额外验证「装进
+`node_modules` 后能被 import、四条臂全部注册、`dsh.bundle.patch` 装载契约存在」）。
 
 配置在 `adapters/dsh/cordis.patch.yml`：
 
@@ -254,6 +266,7 @@ cd adapters/dsh && node --test test/*.test.js            # 适配器契约（伪
 | `docs/04-memory-extraction.md` | 记忆提取设计（hot/warm/cold 三层 + 写入决策 + 同步） |
 | `docs/05-roadmap.md` | 实施路线、测试金字塔、验收记分卡、实测记录 |
 | `reports/phase0-compression-report.md` | 可复现的压缩比报告 |
+| `.github/workflows/ci.yml` | CI：三套测试（Node 22/24）→ 自包含打包 + 产物验证 → tag 发版附 tarball |
 
 ---
 
