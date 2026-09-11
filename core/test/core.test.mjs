@@ -106,6 +106,41 @@ test('meter：按月轮转 + 汇总读取多文件（兼容旧单文件）', () 
   assert.equal(s.files.length, 2)
 })
 
+test('compare：反事实对比与击穿归因（只在真剪枝/真压缩时计入治理量）', async () => {
+  const cfg = makeCfg()
+  const base = { sessionId: 's1' }
+  // 三次请求：前两次缓存命中良好，第三次是剪枝引起的击穿
+  meter.record(cfg, { kind: 'usage', ...base, fresh: 200, cacheRead: 100_000 })
+  meter.record(cfg, { kind: 'usage', ...base, fresh: 300, cacheRead: 120_000 })
+  // shadow 剪枝不算治理量
+  meter.record(cfg, { kind: 'prune', ...base, mode: 'shadow', charsBefore: 90_000, charsAfter: 10_000 })
+  meter.record(cfg, { kind: 'usage', ...base, fresh: 250, cacheRead: 130_000 })
+  // active 剪枝 → 随后一次请求应被判为 lcm 引起的击穿
+  meter.record(cfg, { kind: 'prune', ...base, mode: 'active', charsBefore: 100_000, charsAfter: 20_000 })
+  meter.record(cfg, { kind: 'usage', ...base, fresh: 200_000, cacheRead: 10_000 })
+
+  const { compare } = await import('../compare.mjs')
+  const c = compare(cfg)
+  assert.equal(c.requests, 4)
+  assert.equal(c.savings.trimmedEvents, 1, '只有 active 剪枝计入治理量')
+  assert.equal(c.savings.trimmedTokensTotal, 40_000, '(100,000-20,000)/2')
+  // 反事实：只有最后一次请求带着 40k 已治理 tokens（前三次发生治理之前）
+  assert.equal(c.counterfactual.cached - c.actual.cached, 40_000, '最后一次请求应多带 40k tokens')
+  // 事实账户
+  assert.equal(c.actual.fresh, 200_750)
+  assert.equal(c.busts.count, 1)
+  assert.equal(c.busts.lcmCount, 1, '击穿应归因于 lcm 剪枝')
+  assert.equal(Math.round(c.busts.lcmExtraEquivalent), Math.round(200_000 * 0.9))
+  assert.equal(c.net.breakevenRequests, Math.ceil((200_000 * 0.9) / (40_000 * 0.1)))
+  assert.ok(c.net.equivalent < c.savings.equivalent, '净收益必须扣掉击穿成本')
+})
+
+test('compare：无 usage 数据时如实返回空结果', async () => {
+  const cfg = makeCfg()
+  const { compare } = await import('../compare.mjs')
+  assert.equal(compare(cfg).requests, 0)
+})
+
 test('recover：从会话日志找回被剪枝替换的原文', async () => {
   const cfg = makeCfg()
   const original = 'ORIGINAL-TOOL-OUTPUT ' + 'x'.repeat(50_000)

@@ -110,6 +110,40 @@ async function main() {
     return 0
   }
 
+  if (cmd === 'compare') {
+    const { compare: runCompare } = await import('./compare.mjs')
+    const c = runCompare(cfg)
+    if (c.requests === 0) { console.log('[lcm] 暂无 usage 计量，无法对比'); return 0 }
+    if (args.json) { console.log(JSON.stringify(c, null, 2)); return 0 }
+    const n = (x) => Math.round(x).toLocaleString()
+    const pct = (x) => `${(x * 100).toFixed(1)}%`
+    const ts = (v) => (v === null ? '-' : new Date(v).toLocaleString('sv-SE'))
+    console.log(`对比窗口：${ts(c.window.from)} → ${ts(c.window.to)}（${c.requests} 请求 / ${c.sessions} 会话）`)
+    console.log('')
+    console.log('实际（装 lcm）：')
+    console.log(`  总当量 ${n(c.actual.equivalent)} ｜ 每请求 ${n(c.actual.perRequest)} ｜ 命中率 ${pct(c.actual.hitRate)}`)
+    console.log(`  fresh ${n(c.actual.fresh)} ／ cached ${n(c.actual.cached)}`)
+    console.log('')
+    console.log('反事实（不装 lcm，被剪掉的存量仍在上下文里）：')
+    console.log(`  总当量 ${n(c.counterfactual.equivalent)} ｜ 每请求 ${n(c.counterfactual.perRequest)}`)
+    console.log('')
+    console.log(`治理掉的存量：${c.savings.trimmedEvents} 次剪枝/压缩，累计 ${n(c.savings.trimmedTokensTotal)} tokens 退出热区`)
+    console.log(`毛节省：${n(c.savings.equivalent)} 当量（${pct(c.savings.percent)}）`)
+    console.log(`击穿成本：窗口内共 ${c.busts.count} 次前缀打穿（多付 ${n(c.busts.extraEquivalent)} 当量）`)
+    console.log(`  其中归因于 lcm 剪枝的：${c.busts.lcmCount} 次，${n(c.busts.lcmExtraEquivalent)} 当量`)
+    console.log(`  其余归因于内置折叠/重启/其他插件改动，不计入 lcm 账`)
+    console.log(`净收益：${n(c.net.equivalent)} 当量（${pct(c.net.percent)}）`)
+    if (c.net.breakevenRequests !== null) {
+      console.log(`  盈亏平衡：改写历史需后续 ≥${c.net.breakevenRequests} 个请求才回本；`
+        + `每次剪枝的击穿代价 ≈ ${c.net.bustCostInRequests.toFixed(1)} 个稳态请求的钱`)
+    }
+    console.log('')
+    console.log('分组（仅供参考：剪枝后的请求上下文天然更大，存在增长偏差，非对照实验）：')
+    console.log(`  剪枝前 ${c.groups.beforeTrim.requests} 请求 ｜ 每请求 ${n(c.groups.beforeTrim.perRequest)}`)
+    console.log(`  剪枝后 ${c.groups.afterTrim.requests} 请求 ｜ 每请求 ${n(c.groups.afterTrim.perRequest)} ｜ 平均已治理 ${n(c.groups.afterTrim.avgTrimmedTokens)} tokens`)
+    return 0
+  }
+
   if (cmd === 'recover') {
     const { recoverByHandle } = await import('./recover.mjs')
     const r = await recoverByHandle(args._[0] ?? '', { sessionsDir: args.sessions ?? cfg.sessionsDir })
@@ -186,7 +220,7 @@ async function main() {
     return 0
   }
 
-  console.error('用法: lcm <compress|read|recover|report|sweep|stat>')
+  console.error('用法: lcm <compress|read|recover|report|compare|sweep|stat>')
   return 2
 }
 
