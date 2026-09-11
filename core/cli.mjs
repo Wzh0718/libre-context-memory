@@ -130,12 +130,14 @@ async function main() {
     console.log(`治理掉的存量：${c.savings.trimmedEvents} 次剪枝/压缩，累计 ${n(c.savings.trimmedTokensTotal)} tokens 退出热区`)
     console.log(`毛节省：${n(c.savings.equivalent)} 当量（${pct(c.savings.percent)}）`)
     console.log(`击穿成本：窗口内共 ${c.busts.count} 次前缀打穿（多付 ${n(c.busts.extraEquivalent)} 当量）`)
+    console.log(`  成因分解：${JSON.stringify(c.busts.byCause)}（compaction 优先归因）`)
     console.log(`  其中归因于 lcm 剪枝的：${c.busts.lcmCount} 次，${n(c.busts.lcmExtraEquivalent)} 当量`)
-    console.log(`  其余归因于内置折叠/重启/其他插件改动，不计入 lcm 账`)
     console.log(`净收益：${n(c.net.equivalent)} 当量（${pct(c.net.percent)}）`)
-    if (c.net.breakevenRequests !== null) {
+    if (c.net.breakevenRequests !== null && c.busts.lcmCount > 0) {
       console.log(`  盈亏平衡：改写历史需后续 ≥${c.net.breakevenRequests} 个请求才回本；`
-        + `每次剪枝的击穿代价 ≈ ${c.net.bustCostInRequests.toFixed(1)} 个稳态请求的钱`)
+        + `每次剪枝的击穿代价 ≈ ${c.net.bustCostInRequests?.toFixed(1) ?? '-'} 个稳态请求的钱`)
+    } else if (c.busts.lcmCount === 0) {
+      console.log('  盈亏平衡：本窗口 lcm 未制造任何击穿（搭便车生效），无需回本')
     }
     console.log('')
     console.log('分组（仅供参考：剪枝后的请求上下文天然更大，存在增长偏差，非对照实验）：')

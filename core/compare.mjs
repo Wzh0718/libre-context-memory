@@ -55,7 +55,10 @@ export function compare(cfg, { bustThresholdTokens = 50_000 } = {}) {
   if (usage.length === 0) return { requests: 0 }
 
   const perSession = new Map()   // sessionId → 累计已治理字符数
-  const pendingTrim = new Set()  // 刚发生过真剪枝、尚未结算的会话（用于击穿归因）
+  // 击穿归因：记录自上个 usage 以来该会话发生过什么。
+  // compaction 优先于剪枝——搭便车剪枝总是紧跟折叠发生，同一间隔里的击穿是折叠造成的，
+  // 只有「间隔内只有剪枝、没有折叠」的击穿才归因 lcm（主动模式才会产生这种）。
+  const sinceUsage = new Map()   // sessionId → Set('compaction'|'prune')
   let totalFresh = 0
   let totalCached = 0
   let cfFresh = 0
@@ -73,7 +76,14 @@ export function compare(cfg, { bustThresholdTokens = 50_000 } = {}) {
       perSession.set(id, (perSession.get(id) ?? 0) + chars)
       trimmedTokensTotal += Math.ceil(chars / CHARS_PER_TOKEN)
       trimmedEvents++
-      if (chars > 0) pendingTrim.add(id)
+      if (!sinceUsage.has(id)) sinceUsage.set(id, new Set())
+      sinceUsage.get(id).add('prune')
+      continue
+    }
+    if (event.kind === 'compaction') {
+      const id = event.sessionId ?? 'unknown'
+      if (!sinceUsage.has(id)) sinceUsage.set(id, new Set())
+      sinceUsage.get(id).add('compaction')
       continue
     }
     if (event.kind !== 'usage') continue
@@ -92,10 +102,15 @@ export function compare(cfg, { bustThresholdTokens = 50_000 } = {}) {
     if (trimmedTokens > 0) afterTrim.push(row)
     else beforeTrim.push(row)
     if (fresh > bustThresholdTokens) {
-      const entry = { ts: event.ts, fresh, extra: fresh * (1 - CACHED_PRICE), sessionId: id, attributedToLcm: pendingTrim.has(id) }
-      busts.push(entry)
-      if (entry.attributedToLcm) pendingTrim.delete(id)
+      const causes = sinceUsage.get(id) ?? new Set()
+      const attributedToLcm = causes.has('prune') && !causes.has('compaction')
+      busts.push({
+        ts: event.ts, fresh, extra: fresh * (1 - CACHED_PRICE), sessionId: id,
+        attributedToLcm,
+        cause: attributedToLcm ? 'lcm剪枝' : (causes.has('compaction') ? 'compaction' : '重启/换会话'),
+      })
     }
+    sinceUsage.delete(id)
   }
 
   const equivalent = totalFresh + CACHED_PRICE * totalCached
@@ -104,6 +119,8 @@ export function compare(cfg, { bustThresholdTokens = 50_000 } = {}) {
   const bustExtra = busts.reduce((a, b) => a + b.extra, 0)
   const lcmBusts = busts.filter((b) => b.attributedToLcm)
   const lcmBustExtra = lcmBusts.reduce((a, b) => a + b.extra, 0)
+  const byCause = {}
+  for (const b of busts) byCause[b.cause] = (byCause[b.cause] ?? 0) + 1
   const avg = (rows, field = 'equivalent') => (rows.length ? rows.reduce((a, r) => a + r[field], 0) / rows.length : 0)
   const averagePerRequest = equivalent / usage.length
 
@@ -136,9 +153,11 @@ export function compare(cfg, { bustThresholdTokens = 50_000 } = {}) {
     busts: {
       count: busts.length,
       extraEquivalent: bustExtra,
-      // 归因：剪枝后该会话的第一次请求才算 lcm 引起；其余（内置折叠/重启/其他插件）不计
+      // 归因（compaction 优先）：间隔内只有剪枝没有折叠才算 lcm；
+      // 折叠造成的算 DSH 内置行为；两者都没有的是重启/换会话
       lcmCount: lcmBusts.length,
       lcmExtraEquivalent: lcmBustExtra,
+      byCause,
       list: busts.slice(-5),
     },
     net: {
