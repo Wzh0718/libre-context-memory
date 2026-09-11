@@ -42,6 +42,13 @@ const DEFAULTS = {
   // 剪枝后要等会话再长这么多 token 才允许下一次——这是「臂的节流」，
   // 不是对单条内容设尺寸/年龄规则。
   pruneCooldownTokens: 10_000,
+  // 剪枝时机：
+  // - piggyback（默认）：只在缓存本来要失效时动手（compaction 事件后 / 观测到击穿后），
+  //   改写历史免费；触发权交给 DSH 内置折叠，避免主动制造昂贵的缓存击穿。
+  // - proactive：仍由 budgetTokens 主动触发，只在超长会话显式开（回本需要 ≥104 请求/次，
+  //   实测窗口默认开导致净负 3.2%）。
+  pruneProactive: false,
+  bustThresholdTokens: 50_000, // fresh 超过此值视为「前缀已冷」
   // —— 静态层裁剪臂（system-prompt/assemble）——
   // 工具定义在 ordinal 1–73，是缓存前缀最前端：**会话中途改动 = 击穿整个前缀**。
   // 因此策略必须是「会话无关的确定性规则」（同输入必得同输出 → 天然稳定）。
@@ -153,6 +160,7 @@ export function apply(ctx, config = {}) {
   }
   let warnedNoMeter = false
   const pruneArmedAt = new Map()   // sessionId → 下一次允许剪枝的 token 水位
+  const coldSession = new Set()    // 刚发生 compaction/击穿 → 下次 pre-step 可免费改写历史
 
   ctx.on('tools/post-execute', async (exec, result, next) => {
     // 先放行下游（hook 等）落定结果；我们只 reshape 被 accept 的纯文本结果。
@@ -274,10 +282,24 @@ export function apply(ctx, config = {}) {
         return next()
       }
       const measurement = tokenMeter.measure(session)
-      if (!measurement || measurement.totalTokens <= cfg.budgetTokens) return next()
+      if (!measurement) return next()
       const sessionKey = session.header?.id ?? 'unknown'
       const armedAt = pruneArmedAt.get(sessionKey)
-      if (armedAt !== undefined && measurement.totalTokens < armedAt) return next()   // 冷却中
+      if (armedAt !== undefined && measurement.totalTokens < armedAt) {
+        coldSession.delete(sessionKey) // 冷却中，错过本次免费窗口也不保留
+        return next()
+      }
+
+      const isCold = coldSession.has(sessionKey)
+      // 搭便车：只在缓存本来要失效时才改写历史（compaction 事件后 / 观测到击穿后）
+      // 并设 budgetTokens 守卫：太小的会话不值得一剪
+      const piggybackOk = isCold && measurement.totalTokens > cfg.budgetTokens
+      // 主动路径：显式开，且仍要越过预算守卫
+      const proactiveOk = cfg.pruneProactive && measurement.totalTokens > cfg.budgetTokens
+      if (!piggybackOk && !proactiveOk) {
+        coldSession.delete(sessionKey)
+        return next()
+      }
 
       const candidates = []
       for (const seq of [...session.surface.nodes]) {
@@ -339,6 +361,7 @@ export function apply(ctx, config = {}) {
       // （实测踩到：剪完测量值仍高于推算水位 → 冷却形同虚设）
       const after = tokenMeter.measure(session)?.totalTokens ?? (measurement.totalTokens - savedTokens)
       pruneArmedAt.set(sessionKey, after + cfg.pruneCooldownTokens)
+      coldSession.delete(sessionKey) // 本次免费/主动窗口已用完
       meter.record(lcmCfg, {
         kind: 'prune', sessionId, mode: cfg.mode,
         tokensBefore: measurement.totalTokens, budgetTokens: cfg.budgetTokens,
@@ -369,15 +392,18 @@ export function apply(ctx, config = {}) {
         const fresh = u.inputTokens ?? 0
         const cacheRead = u.cacheReadTokens ?? 0
         const total = fresh + cacheRead
+        // 前缀已冷 = 可以免费改写历史的时机（compaction/击穿）
+        if (sessionId && fresh > cfg.bustThresholdTokens) coldSession.add(sessionId)
         meter.record(lcmCfg, {
           kind: 'usage', sessionId,
           input: fresh, cacheRead, fresh,
           hitRate: total > 0 ? Number((cacheRead / total).toFixed(4)) : null,
           output: u.outputTokens ?? null,
-          // 击穿苗头：新增很小却大额 fresh（阈值对齐 docs/01：fresh>50k）
-          cacheBust: fresh > 50_000,
+          // 击穿苗头：新增很小却大额 fresh（阈值对齐 cfg.bustThresholdTokens）
+          cacheBust: fresh > cfg.bustThresholdTokens,
         })
       } else if (typeof type === 'string' && type.startsWith('compaction/')) {
+        coldSession.add(sessionId)
         meter.record(lcmCfg, {
           kind: 'compaction', sessionId, op: type,
           shadowedTokens: event?.data?.shadowedTokenCount ?? null,
@@ -386,7 +412,7 @@ export function apply(ctx, config = {}) {
     } catch { /* 观测臂失败静默 */ }
   })
 
-  ctx.logger.info(`dsh-lcm loaded: mode=${cfg.mode} maxInlineChars=${cfg.maxInlineChars}`)
+  ctx.logger.info(`dsh-lcm loaded: mode=${cfg.mode} maxInlineChars=${cfg.maxInlineChars} pruneProactive=${cfg.pruneProactive}`)
   // 终端可见性：ctx.logger 不进 stdout，启动确认行直接 console（与其他 dsh 插件一致）
-  console.log(`[dsh-lcm] loaded, mode=${cfg.mode}, maxInlineChars=${cfg.maxInlineChars}`)
+  console.log(`[dsh-lcm] loaded, mode=${cfg.mode}, maxInlineChars=${cfg.maxInlineChars}, pruneProactive=${cfg.pruneProactive}`)
 }

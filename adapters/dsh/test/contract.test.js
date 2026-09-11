@@ -64,6 +64,13 @@ async function runPreStep(ctx, session) {
   assert.ok(nextCalled, 'pre-step 必须放行 next()')
 }
 
+function emitSessionEvent(ctx, session, event) {
+  const { fn } = ctx.listeners.find((l) => l.event === 'session/event')
+  assert.ok(fn, '缺少 session/event 监听')
+  if (!event.sessionId) event.sessionId = session.header.id
+  return fn(session, event)
+}
+
 function fakeExec(name = 'bash', sessionId = 'sess-test') {
   return {
     name,
@@ -188,6 +195,7 @@ test('剪枝臂 shadow：超预算完整计算+记账，但不改写历史', asy
   apply(ctx, { mode: 'shadow', lcmRoot })
   withTokenMeter(ctx, 150_000)
   const session = fakeSession(lcmRoot, [toolResultEvent('x'.repeat(80_000)), toolResultEvent('y'.repeat(80_000))])
+  emitSessionEvent(ctx, session, { type: 'compaction/basic' })
   await runPreStep(ctx, session)
   assert.equal(session.appends.length, 0)  // 影子不改写
   const { summary } = await import('../../../core/meter.mjs')
@@ -207,6 +215,7 @@ test('剪枝臂 active：shadow-price + replace 成对落地，最新节点跳�
     toolResultEvent('a'.repeat(80_000)),   // seq1 最老最大 → 被剪
     toolResultEvent('b'.repeat(80_000)),   // seq2 最新 → 保留
   ])
+  emitSessionEvent(ctx, session, { type: 'compaction/basic' })
   await runPreStep(ctx, session)
   const ops = session.appends.filter((a) => a.type === 'tool/result')
   const prices = session.appends.filter((a) => a.type === 'compaction/prune')
@@ -278,6 +287,7 @@ test('剪枝臂 active：介于压缩直通区（2k–20k）的节点也必须�
   const mid = ('INFO worker heartbeat line with some payload\n').repeat(120)   // ≈5k 字符
   assert.ok([...mid].length > 2_000 && [...mid].length < 20_000)
   const session = fakeSession(lcmRoot, [toolResultEvent(mid), toolResultEvent('x'.repeat(40_000))])
+  emitSessionEvent(ctx, session, { type: 'compaction/basic' })
   await runPreStep(ctx, session)
   const ops = session.appends.filter((a) => a.type === 'tool/result')
   // 最大的恰好是最新节点（seq2）→ 受保护跳过；被剪的是老的中等节点（seq1）
@@ -308,6 +318,7 @@ test('剪枝冷却：剪过一次后要等会话再长够 token 才允许再剪�
   const { fn } = ctx.listeners.find((l) => l.event === 'agent/pre-step')
   const entries = [toolResultEvent('a'.repeat(40_000)), toolResultEvent('b'.repeat(40_000)), toolResultEvent('c'.repeat(40_000))]
   const session = fakeSession(lcmRoot, entries)
+  emitSessionEvent(ctx, session, { type: 'compaction/basic' })
   // 假 meter：压力随会话**当前内容**变化（压缩/剪枝后自然下降），贴近真实 tokenMeter 语义
   let overhead = 60_000
   ctx.services.tokenMeter = {
@@ -335,10 +346,64 @@ test('剪枝冷却：剪过一次后要等会话再长够 token 才允许再剪�
   const before = session.appends.length
   await fn({ agent: { session } }, async () => {})
   assert.equal(session.appends.length, before, '冷却窗口内不得再次剪枝（避免反复击穿前缀）')
-  // 会话真长够了 → 重新允许
+  // piggyback 模式下，光长够不会触发；需要再来一次 free-cold 事件
   overhead += 40_000
   await fn({ agent: { session } }, async () => {})
-  assert.ok(session.appends.length > before, '超过冷却水位后应重新允许剪枝')
+  assert.equal(session.appends.length, before, '没有新的免费窗口时不得再次剪枝')
+  // 新的 compaction 事件触发 → 冷却已过期 → 允许再次剪枝
+  emitSessionEvent(ctx, session, { type: 'compaction/basic' })
+  await fn({ agent: { session } }, async () => {})
+  assert.ok(session.appends.length > before, '新的免费窗口 + 超过冷却水位后应重新允许剪枝')
+})
+
+test('piggyback：没有免费窗口时，即使超预算也不主动制造击穿', async () => {
+  const ctx = fakeCtx()
+  const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-piggyback-'))
+  apply(ctx, { mode: 'active', lcmRoot, budgetTokens: 100_000 })
+  withTokenMeter(ctx, 150_000)
+  const session = fakeSession(lcmRoot, [toolResultEvent('a'.repeat(80_000)), toolResultEvent('b'.repeat(80_000))])
+  await runPreStep(ctx, session)
+  assert.equal(session.appends.length, 0, '默认 proactive=false 且没有 cold 事件 → 不剪')
+})
+
+test('piggyback：compaction 事件后但低于 budgetTokens 守卫 → 不剪，且 cold 标记被消费', async () => {
+  const ctx = fakeCtx()
+  const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-piggyback-guard-'))
+  apply(ctx, { mode: 'active', lcmRoot, budgetTokens: 100_000 })
+  withTokenMeter(ctx, 80_000) // 低于 budget
+  const session = fakeSession(lcmRoot, [toolResultEvent('a'.repeat(40_000))])
+  emitSessionEvent(ctx, session, { type: 'compaction/basic' })
+  await runPreStep(ctx, session)
+  assert.equal(session.appends.length, 0, '低于守卫 → 不剪')
+  // cold 标记应已被消费；即使现在压力涨上来，没有新事件也不能剪
+  withTokenMeter(ctx, 150_000)
+  await runPreStep(ctx, session)
+  assert.equal(session.appends.length, 0, '过期 cold 标记不得复用')
+})
+
+test('piggyback：观测到击穿后下一次 pre-step 可免费剪枝', async () => {
+  const ctx = fakeCtx()
+  const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-piggyback-bust-'))
+  apply(ctx, { mode: 'active', lcmRoot, budgetTokens: 100_000, bustThresholdTokens: 50_000 })
+  withTokenMeter(ctx, 150_000)
+  const session = fakeSession(lcmRoot, [toolResultEvent('a'.repeat(80_000)), toolResultEvent('b'.repeat(80_000))])
+  // 模拟一次击穿：usage.fresh > 阈值（前缀已冷）
+  emitSessionEvent(ctx, session, {
+    type: 'assistant/message',
+    data: { usage: { inputTokens: 60_000, cacheReadTokens: 10_000 } },
+  })
+  await runPreStep(ctx, session)
+  assert.ok(session.appends.length > 0, '击穿后应触发免费剪枝')
+})
+
+test('proactive=true 时仍可按原主动预算路径触发', async () => {
+  const ctx = fakeCtx()
+  const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-proactive-'))
+  apply(ctx, { mode: 'active', lcmRoot, budgetTokens: 100_000, pruneProactive: true })
+  withTokenMeter(ctx, 150_000)
+  const session = fakeSession(lcmRoot, [toolResultEvent('a'.repeat(80_000)), toolResultEvent('b'.repeat(80_000))])
+  await runPreStep(ctx, session)
+  assert.ok(session.appends.length > 0, '显式开 proactive 后无 cold 事件也应剪枝')
 })
 
 test('非法 mode 在加载期拒绝', () => {
