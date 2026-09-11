@@ -1,0 +1,34 @@
+{
+  "name": "dsh-lcm",
+  "version": "0.1.0",
+  "description": "libre-context-memory DSH adapter: semantic compression of oversized tool results with spill-handle retrieval (shadow mode by default)",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "engines": {
+    "node": ">=22.19"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "node --check src/index.js"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "context",
+    "compression",
+    "spill",
+    "libre-context-memory"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "compatibility": {
+      "dsh": ">=0.1.2-rc.1"
+    }
+  }
+}
