@@ -19,7 +19,7 @@
  *   绝不让成功调用变错误。
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 
@@ -59,6 +59,7 @@ const DEFAULTS = {
   bustThresholdTokens: 50_000, // fresh 超过此值视为「前缀已冷」
   // —— 记忆臂（Phase 3：本地 ~/.lcm/memories + OpenViking 双写）——
   memoryExtract: true,         // compaction/summary → 确定性提取入库（搭 DSH 内置摘要便车，零 LLM 调用）
+  memoryExtractIncremental: true, // 增量熔炼臂：pre-step 水位线扫新增 user/assistant 轮次提取入库
   memoryInjectMode: 'shadow',  // 记忆注入单独模式：shadow 只记账；active 在请求尾部追加检索块（前缀安全）
   memoryInjectMaxEntries: 6,   // 注入块条目上限（预算纪律：注入自身不能成为体积源）
   // —— 静态层裁剪臂（system-prompt/assemble）——
@@ -130,6 +131,13 @@ export function trimTools(tools, cfg) {
       changed: tools.length - out.length + descTrimmed,
     },
   }
+}
+
+/** 文本块拼接（宽松版：混入图片等非文本块时只取文本部分；全无文本返回 null）。 */
+function flattenTextBlocks(content) {
+  if (!Array.isArray(content)) return null
+  const text = content.filter((b) => b?.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n').trim()
+  return text || null
 }
 
 /** 全部文本块拼成一个字符串；含任何非文本块则返回 undefined（不处理）。 */
@@ -215,6 +223,8 @@ export function apply(ctx, config = {}) {
   const coldSession = new Set()    // 刚发生 compaction/击穿 → 下次 pre-step 可免费改写历史
   const preStepSeen = new Set()    // 已经历过 pre-step 的会话（继承冷启动窗口只在首个 pre-step 有效）
   const lastInjectDigest = new Map() // sessionId → 上次注入的条目 digest（内容没变不重复注入）
+  const extractWatermark = new Map() // sessionId → 已熔炼到的最大 seq（持久化在 meterDir，重启不重扫）
+  let watermarkLoaded = false
   // 计量统一落全局根（默认 ~/.lcm，LCM_METER_ROOT / cordis 配置可覆盖），
   // 事件带 project 字段（会话 cwd）——此前按会话 cwd + 服务器 cwd 分散落点，
   // report/compare 只能看到一个项目的零头数据（实测 85% 的事件落在别的根）。
@@ -448,11 +458,77 @@ export function apply(ctx, config = {}) {
       )
   }
 
+  // ---- 增量熔炼臂：水位线扫「本步新增」的 user/assistant 轮次 → 提取入库 ----
+  // 纪律：只扫 seq > 水位线的节点（每步增量，O(新增)）；无候选零 IO（提取器纯内存，
+  // 有候选才 record 读库）；插件注入与 harness 伪装消息必须过滤（实测污染第一）；
+  // 低分门槛（incremental 来源 0.6）挡噪声；幂等键兜住重扫/双写。
+  const runExtract = (agent) => {
+    if (!cfg.memoryExtractIncremental) return
+    const session = agent?.session
+    if (!session?.surface || typeof session.eventAt !== 'function') return
+    if (!watermarkLoaded) { loadWatermarks(); watermarkLoaded = true }
+    const sessionKey = session.header?.id ?? 'unknown'
+    const lastSeq = extractWatermark.get(sessionKey) ?? -1
+    let maxSeq = lastSeq
+    let stored = 0, rejected = 0, scanned = 0
+    const capLeft = { n: 24 }   // 每步候选总上限（防多 step 爆发）
+    for (const seq of [...session.surface.nodes]) {
+      if (seq <= lastSeq) continue
+      maxSeq = Math.max(maxSeq, seq)
+      const event = session.eventAt(seq)
+      let t = null
+      if (event?.type === 'user/message') {
+        if (event.data?.source?.kind !== 'user') continue          // 插件注入/harness 伪装
+        t = flattenTextBlocks(event.data?.content)
+        if (t && profile.isHarnessTalk(t)) t = null
+      } else if (event?.type === 'assistant/message') {
+        t = flattenTextBlocks(event.data?.message?.content)
+      }
+      if (!t || capLeft.n <= 0) continue
+      scanned++
+      for (const c of memory.extractCandidates(t)) {               // 纯内存，零 IO
+        if (capLeft.n-- <= 0) break
+        const r = memory.record(meterBase, {
+          ...c, source: 'incremental', sessionId: sessionKey,
+          project: session.header?.cwd ?? null,
+        })
+        if (r.action === 'ADD' || r.action === 'UPDATE') stored++
+        else if (r.action === 'REJECT') rejected++
+      }
+    }
+    if (maxSeq !== lastSeq) {
+      extractWatermark.set(sessionKey, maxSeq)
+      saveWatermarks()
+    }
+    if (scanned > 0 && (stored > 0 || rejected > 0)) {
+      ctx.logger.info(`dsh-lcm memory: 增量熔炼扫 ${scanned} 轮 → 入库 ${stored} 条（低分拒 ${rejected}）`)
+    }
+  }
+
+  const watermarkFile = () => join(meterBase.meterDir, 'extract-watermark.json')
+  function loadWatermarks() {
+    try {
+      const data = JSON.parse(readFileSync(watermarkFile(), 'utf8'))
+      for (const [k, v] of Object.entries(data)) if (Number.isFinite(v)) extractWatermark.set(k, v)
+    } catch { /* 无水位线文件：从头扫（幂等兜住重扫） */ }
+  }
+  function saveWatermarks() {
+    try {
+      mkdirSync(meterBase.meterDir, { recursive: true })
+      writeFileSync(watermarkFile(), JSON.stringify(Object.fromEntries(extractWatermark)), 'utf8')
+    } catch { /* 只读环境静默 */ }
+  }
+
   ctx.on('agent/pre-step', async ({ agent }, next) => {
     try {
       await runPrune(agent)
     } catch (error) {
       ctx.logger.warn(`dsh-lcm: prune failed: ${String(error?.message ?? error)}; continuing the turn`)
+    }
+    try {
+      runExtract(agent)
+    } catch (error) {
+      ctx.logger.warn(`dsh-lcm: incremental extract failed: ${String(error?.message ?? error)}; continuing`)
     }
     // ---- 记忆注入（拿住 decision，请求尾部追加稳定块；同 dsh-time-context 的注入模式）----
     // 纪律：尾部追加绝不插中间（前缀安全）；digest 没变不重复注入（注入自身不能成为体积源）；

@@ -670,3 +670,73 @@ test('画像热路径纪律：无缓存时不注入不阻塞（allowScan:false �
   })
   assert.equal(out.messages.length, 1, '无画像缓存、无记忆命中 → 原样放行')
 })
+
+// ---------------------------------------------------------------- 增量熔炼臂
+
+function userMsgEvent(text, kind = 'user') {
+  return { type: 'user/message', data: { role: 'user', content: [{ type: 'text', text }], source: { kind } } }
+}
+function assistantMsgEvent(text) {
+  return { type: 'assistant/message', data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text }] } } }
+}
+
+test('增量熔炼臂：水位线只扫新增轮次，过滤插件注入与 harness 模板', async () => {
+  const ctx = fakeCtx()
+  const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-incr-'))
+  applyT(ctx, { mode: 'active', lcmRoot })
+  const session = fakeSession(lcmRoot, [
+    userMsgEvent('插件注入的上下文不该被熔炼 source 是 plugin', 'plugin'),       // seq1 过滤
+    userMsgEvent('Review the inherited completed checkpoint now.'),            // seq2 harness 模板过滤
+    userMsgEvent('我们决定：记忆臂搭 DSH 内置 summary 便车，零 LLM 调用，v1.2 上线'),  // seq3 入库
+    assistantMsgEvent('- 实测：增量提取窗口比 summary 覆盖率高 92%，benchmark 在 core/meter.mjs'), // seq4 入库
+  ])
+  await runPreStep(ctx, session)
+
+  const { activeEntries } = await import('../../../core/memory.mjs')
+  const live = activeEntries(lcfg(lcmRoot))
+  assert.ok(live.length >= 2, `应入库 ≥2 条（实际 ${live.length}）`)
+  assert.ok(live.every((e) => e.source === 'incremental'))
+  assert.ok(live.some((e) => e.type === 'decision'), '决定句入库')
+  assert.ok(!live.some((e) => e.claim.includes('插件注入的上下文')), '插件注入不得入库')
+  assert.ok(!live.some((e) => e.claim.includes('checkpoint')), 'harness 模板不得入库')
+
+  // 水位线推进：同样的消息再跑一次 → 零新增（不再扫描，更不改库）
+  const before = readFileSync(join(lcmRoot, '.lcm', 'memories', 'memories.jsonl'), 'utf8')
+  await runPreStep(ctx, session)
+  assert.equal(readFileSync(join(lcmRoot, '.lcm', 'memories', 'memories.jsonl'), 'utf8'), before, '水位线后重扫不得产生任何写入')
+})
+
+test('增量熔炼臂：水位线持久化——重启（新 apply）后不重复处理', async () => {
+  const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-incr-wm-'))
+  const ctx1 = fakeCtx()
+  applyT(ctx1, { mode: 'active', lcmRoot })
+  const session = fakeSession(lcmRoot, [
+    userMsgEvent('决定：采用 outbox 模式做 OpenViking 同步，v2.0 前上线'),
+  ])
+  await runPreStep(ctx1, session)
+  const { activeEntries } = await import('../../../core/memory.mjs')
+  const live1 = activeEntries(lcfg(lcmRoot))
+  assert.ok(live1.length >= 1)
+  // 水位线文件存在
+  const wm = JSON.parse(readFileSync(join(lcmRoot, '.lcm', 'extract-watermark.json'), 'utf8'))
+  assert.ok(wm['sess-prune'] >= 1, '水位线必须持久化')
+
+  // 「重启」：新 apply（新 Map），同会话同消息 → 从文件恢复水位线，零新写入
+  const ctx2 = fakeCtx()
+  applyT(ctx2, { mode: 'active', lcmRoot })
+  const before = readFileSync(join(lcmRoot, '.lcm', 'memories', 'memories.jsonl'), 'utf8')
+  await runPreStep(ctx2, session)
+  assert.equal(readFileSync(join(lcmRoot, '.lcm', 'memories', 'memories.jsonl'), 'utf8'), before,
+    '重启后水位线恢复，不得重复熔炼')
+})
+
+test('增量熔炼臂：无新增轮次零副作用；关闭开关后完全停用', async () => {
+  const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-incr-off-'))
+  const ctx = fakeCtx()
+  applyT(ctx, { mode: 'active', lcmRoot, memoryExtractIncremental: false })
+  const session = fakeSession(lcmRoot, [
+    userMsgEvent('决定：这条本来该入库的内容因为开关关闭而不能入库 v9.9'),
+  ])
+  await runPreStep(ctx, session)
+  assert.ok(!existsSync(join(lcmRoot, '.lcm', 'memories')), '开关关闭不得产生记忆库')
+})
