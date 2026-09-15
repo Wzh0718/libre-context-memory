@@ -27,6 +27,7 @@ import { compress } from '../../../core/compress.mjs'
 import { loadConfig } from '../../../core/config.mjs'
 import * as meter from '../../../core/meter.mjs'
 import * as memory from '../../../core/memory.mjs'
+import * as profile from '../../../core/profile.mjs'
 import * as spill from '../../../core/spill.mjs'
 
 export const name = 'dsh-lcm'
@@ -461,30 +462,37 @@ export function apply(ctx, config = {}) {
       if (cfg.memoryInjectMode !== 'active' && cfg.memoryInjectMode !== 'shadow') return decision
       if (!decision || decision.kind === 'reject' || !Array.isArray(decision.messages)) return decision
       const sessionKey2 = agent?.session?.header?.id ?? 'unknown'
+      // 常驻画像块：只读缓存（allowScan:false——全量扫描是分钟级，绝不进请求热路径）
+      let profileBlock = null
+      try {
+        const prof = profile.getProfile(meterBase, { allowScan: false })
+        profileBlock = profile.renderProfileBlock(meterBase, prof ?? {})
+      } catch { /* 画像缺失静默 */ }
       const query = lastUserQuery(decision.messages)
-      if (!query) return decision
-      const entries = memory.search(meterBase, query, { k: cfg.memoryInjectMaxEntries })
-      if (entries.length === 0) return decision
-      const digest = createHash('sha256').update(entries.map((e) => e.id).join(',')).digest('hex').slice(0, 12)
+      const entries = query ? memory.search(meterBase, query, { k: cfg.memoryInjectMaxEntries }) : []
+      const block = entries.length > 0 ? memory.renderInjectBlock(query, entries) : null
+      const text = [profileBlock, block].filter(Boolean).join('\n')
+      if (!text) return decision
+      const digest = createHash('sha256').update(text).digest('hex').slice(0, 12)
       if (lastInjectDigest.get(sessionKey2) === digest) return decision   // 内容没变，不重复注入
       lastInjectDigest.set(sessionKey2, digest)
-      const block = memory.renderInjectBlock(query, entries)
       meter.record(meterBase, {
         kind: 'memory-inject', mode: cfg.memoryInjectMode,
-        query: query.slice(0, 80), entries: entries.length, chars: [...block].length,
+        query: query?.slice(0, 80) ?? '', entries: entries.length, chars: [...text].length,
+        profile: Boolean(profileBlock),
         sessionId: sessionKey2, project: agent?.session?.header?.cwd ?? null,
       })
       if (cfg.memoryInjectMode === 'shadow') {
-        ctx.logger.info(`dsh-lcm [shadow] memory-inject: ${entries.length} 条（${query.slice(0, 40)}…，未注入）`)
+        ctx.logger.info(`dsh-lcm [shadow] memory-inject: ${entries.length} 条（${(query ?? '(画像常驻)').slice(0, 40)}…，未注入）`)
         return decision
       }
-      ctx.logger.info(`dsh-lcm memory-inject: ${entries.length} 条（${query.slice(0, 40)}…）`)
+      ctx.logger.info(`dsh-lcm memory-inject: ${entries.length} 条（${(query ?? '(画像常驻)').slice(0, 40)}…）`)
       return {
         ...decision,
         messages: [...decision.messages, {
           role: 'user',
-          content: [{ type: 'text', text: block }],
-          source: { kind: 'plugin', plugin: 'dsh-lcm', form: 'snapshot', sections: [{ name: 'lcm-memory', text: block }] },
+          content: [{ type: 'text', text }],
+          source: { kind: 'plugin', plugin: 'dsh-lcm', form: 'snapshot', sections: [{ name: 'lcm-memory', text }] },
         }],
       }
     } catch (error) {

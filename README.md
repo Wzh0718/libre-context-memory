@@ -264,6 +264,9 @@ pruneCooldownTokens: 10000    # 剪过一次后，会话需再长够此值才允
 pruneProactive: false         # true=回到主动预算触发（默认关）
 bustThresholdTokens: 50000    # fresh 超过此值视为「前缀已冷」
 pruneMinChars: 4000           # 候选下限：摘要本身 ~1k 字符，太小的剪了没收益
+# —— 画像层（②习惯 + ③行为，常驻注入，硬预算 900 chars）——
+# profileInject: true           # <lcm-profile> 块伴随记忆注入（digest 节流）
+# 首次/每日：node core/cli.mjs profile --refresh（全量扫描离线做，热路径只读缓存）
 # —— 记忆臂（Phase 3）——
 memoryExtract: true           # compaction/summary → 确定性提取入库（零 LLM 调用）
 memoryInjectMode: shadow      # active = 请求尾部追加检索块（digest 节流，前缀安全）
@@ -286,7 +289,8 @@ node core/cli.mjs memory sync                                           # 冲 Op
 node core/cli.mjs memory stats                                          # 库况/同步积压
 ```
 
-写入不是 append 而是四选一决策（ADD/UPDATE/DELETE/NOOP，按 subject + claim 相似度分流）；
+画像：`lcm profile [--refresh|--json]`——习惯画像（只扫 user talk：意图/开场/确认率/句式指纹/推进链；过滤 DSH checkpoint 伪装消息 + 续接重放去重）+ 行为画像（meter 统计：活跃节奏/注意力/会话深度）→ `<lcm-profile>` 常驻块（预算内截断，模型第一轮就知道怎么协作——省对齐轮次）。
+写入不是 append 而是四选一决策（ADD/UPDATE/DELETE/NOOP，按 subject + claim 相似度分流；低分候选按来源分层拒之门外：manual 不限 / summary 0.45 / 原始轮 0.6）；
 secrets/瞬态/过短内容被硬过滤在库门外；条目幂等键 = 内容哈希（重试/双写/flush 不产生重复）。
 提取搭 DSH 内置 `compaction/summary` 的便车——LLM 摘要产物过确定性提取器，零额外调用。
 
@@ -308,9 +312,9 @@ cd adapters/dsh && node --test test/*.test.js            # 适配器契约（伪
 
 | 套件 | 数量 | 结果 | 覆盖 |
 |---|---|---|---|
-| core 测试 | 26 | ✅ 26/26 | 压缩往返无损（含中文/emoji）、内容寻址去重、TTL 清理、容量上限最旧优先、清扫节流、计量轮转、**全局/项目根合并读取**、**旧口径 fresh 归一化 + 按项目过滤**、**记忆写入决策四分支/禁写过滤/检索预算/注入确定性/提取幂等/outbox + mock HTTP 同步**、多帧 zstd 会话日志恢复、非法输入 |
+| core 测试 | 38 | ✅ 38/38 | 压缩往返无损（含中文/emoji）、内容寻址去重、TTL 清理、容量上限最旧优先、清扫节流、计量轮转、**全局/项目根合并读取**、**旧口径 fresh 归一化 + 按项目过滤**、**记忆写入决策四分支/禁写过滤/质量门槛分层/检索预算/注入确定性/提取幂等（表格行/引用前缀/冗余 subject 归零）/outbox + mock HTTP 同步**、**画像：harness 伪装消息过滤/续接重放去重/意图分类/句式指纹/预算截断保闭合/热路径只读缓存**、多帧 zstd 会话日志恢复、非法输入 |
 | **会话存活回放** | 5 | ✅ 5/5 | 用 DSH 自己的 `foldSurface` 回放含替换事件的日志：折叠接受、**surface 只剩替换节点**、原文仍在日志（可恢复）、折叠确定性、**反向校验生效**（越界改写被拒、缺 `sourceEventSeqs` 被拒） |
-| 适配器契约 | 27 | ✅ 27/27 | 直通/透传分支、shadow 不替换、active 替换+句柄可回取、失败静默、观测臂记账（project 标签）、剪枝预算/最小/最大优先/最新保护/冷却、piggyback 三窗口（compaction/击穿/**继承冷启动**）+ 守卫用例、静态层确定性 + **trim-diff 复核工件**、**记忆提取臂（summary→入库幂等）/注入臂（尾部追加 + digest 节流 + shadow）**、分臂模式、非法配置拒绝 |
+| 适配器契约 | 29 | ✅ 29/29 | 直通/透传分支、shadow 不替换、active 替换+句柄可回取、失败静默、观测臂记账（project 标签）、剪枝预算/最小/最大优先/最新保护/冷却、piggyback 三窗口（compaction/击穿/**继承冷启动**）+ 守卫用例、静态层确定性 + **trim-diff 复核工件**、**记忆提取臂（summary→入库幂等 + 质量门槛行为锁定）/注入臂（尾部追加 + digest 节流 + shadow）/画像常驻注入（无查询也注入 + 同会话节流）**、分臂模式、非法配置拒绝 |
 | Phase 0 回放 | 144 样本 | ✅ 全达标 | 1428.3×，确定性 144/144 |
 
 **会话存活为什么是必测项**：剪枝会**改写会话历史**。若替换事件不满足 DSH 的校验规则（`surface.ts`：只能改 content、`shadowedSeqs` 恰好一个、`sourceEventSeqs` 必须覆盖被替换节点；`invariant.ts`：替换必须在打开的 turn 内追加），会话在重启/恢复时会加载失败。我们用 DSH 编译产物里的 `foldSurface` 直接回放验证，并且**包含反向用例**证明校验真的在跑。

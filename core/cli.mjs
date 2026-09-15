@@ -343,6 +343,28 @@ async function main() {
     return failed.length > 0 ? 1 : 0
   }
 
+  if (cmd === 'profile') {
+    const prof = await import('./profile.mjs')
+    const p = prof.getProfile(cfg, { force: Boolean(args.refresh) })
+    if (!p || (!p.habit && !p.behavior)) {
+      console.error(args.refresh ? '[lcm] 无可画像数据（会话日志/计量事件不足）' : '[lcm] 无缓存画像，先跑：lcm profile --refresh')
+      return 1
+    }
+    if (args.json) { console.log(JSON.stringify(p, null, 2)); return 0 }
+    const h = p.habit; const b = p.behavior
+    console.log(`画像（${p.stale ? '缓存已过期，建议 lcm profile --refresh' : '缓存 ' + new Date(p.builtAt).toISOString().slice(0, 16).replace('T', ' ')}）`)
+    if (b) console.log(`  行为：活跃 ${b.peakHours}｜注意力 ${b.attention.join('、')}｜会话中位 ${b.sessionMedian} 请求｜深潜 ${b.deepSessions} 个`)
+    if (h) {
+      console.log(`  习惯：${h.sessions} 会话 ${h.talks} talk｜意图 ${h.intentOrder.join('>')}`)
+      console.log(`        开场 ${Object.entries(h.openers).map(([k, v]) => k + '×' + v).join(' ')}｜确认率 ${Math.round(h.confirmRate * 100)}%｜链 ${h.topChain}`)
+      if (h.phrases?.length) console.log(`        口头禅：${h.phrases.map(([x, n]) => x + '(' + n + ')').join('、')}`)
+      if (h.terms?.length) console.log(`        高频术语：${h.terms.slice(0, 8).map(([x, n]) => x + '(' + n + ')').join('、')}`)
+    }
+    console.log('── 常驻注入块（预算 ' + prof.PROFILE_MAX_CHARS + ' chars）──')
+    console.log(prof.renderProfileBlock(cfg, p))
+    return 0
+  }
+
   if (cmd === 'memory') {
     const mem = await import('./memory.mjs')
     const sub = args._[0] ?? 'stats'
@@ -398,7 +420,7 @@ async function main() {
     return 0
   }
 
-  console.error('用法: lcm <compress|read|recover|report|compare|sweep|stat|trim-diff|migrate|memory>')
+  console.error('用法: lcm <compress|read|recover|report|compare|sweep|stat|trim-diff|migrate|memory|profile>')
   return 2
 }
 

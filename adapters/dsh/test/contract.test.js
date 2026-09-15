@@ -2,7 +2,7 @@
 
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, readdirSync, readFileSync, existsSync, statSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, existsSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -609,4 +609,64 @@ test('记忆注入臂：无真实用户消息（全是插件注入）→ 不检�
   const out = await runPreStepWithDecision(ctx, session, base)
   assert.equal(out.messages.length, 1)
   assert.equal(readMeterEvents(lcmRoot, 'memory-inject').length, 0, '无查询不得记账')
+})
+
+// ---------------------------------------------------------------- 画像常驻注入
+
+test('画像块常驻注入：有缓存时即使无检索命中（甚至无查询）也注入 <lcm-profile>', async () => {
+  const ctx = fakeCtx()
+  const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-profinj-'))
+  applyT(ctx, { mode: 'active', lcmRoot, memoryInjectMode: 'active' })
+  // 预置画像缓存（适配器热路径只读缓存，绝不在线扫描）
+  mkdirSync(join(lcmRoot, '.lcm'), { recursive: true })
+  writeFileSync(join(lcmRoot, '.lcm', 'profile.json'), JSON.stringify({
+    builtAt: Date.now(),
+    habit: { sessions: 9, talks: 90, confirmRate: 0.3, openers: { 确认: 5 }, topChain: '理解→行动', phrases: [['你能理解吗', 7]], terms: [] },
+    behavior: { requests: 100, peakHours: '10点+17点', attention: ['lcm 60%'], sessionMedian: 3, deepSessions: 2 },
+  }))
+
+  // 场景 1：无记忆库命中，但 profile 存在 → 仍注入
+  const session1 = fakeSession(lcmRoot, [])
+  const out1 = await runPreStepWithDecision(ctx, session1, {
+    kind: 'run',
+    messages: [{ role: 'user', content: [{ type: 'text', text: '一个全新话题' }], source: { kind: 'user' } }],
+  })
+  assert.equal(out1.messages.length, 2, 'profile 常驻：无检索命中也要注入')
+  assert.ok(out1.messages[1].content[0].text.includes('<lcm-profile>'))
+  assert.ok(out1.messages[1].content[0].text.includes('协作习惯'))
+  assert.equal(out1.messages[1].source.plugin, 'dsh-lcm')
+
+  // 场景 2：另一个会话、连查询都没有（全是插件消息）→ profile 仍常驻。
+  // （同一会话内重复注入被 digest 节流——那是设计行为，上一场景已覆盖）
+  const session2 = { ...session1, header: { ...session1.header, id: 'sess-profile-2' } }
+  const out2 = await runPreStepWithDecision(ctx, session2, {
+    kind: 'run',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'plugin snapshot' }], source: { kind: 'plugin', plugin: 'other' } }],
+  })
+  assert.equal(out2.messages.length, 2)
+  assert.ok(out2.messages[1].content[0].text.startsWith('<lcm-profile>'))
+
+  // meter 记账带 profile 标记
+  const inj = readMeterEvents(lcmRoot, 'memory-inject')
+  assert.equal(inj.length, 2)
+  assert.ok(inj.every((e) => e.profile === true))
+
+  // digest 节流：profile + 检索内容都没变 → 不重复注入
+  const out3 = await runPreStepWithDecision(ctx, session1, {
+    kind: 'run',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'plugin snapshot' }], source: { kind: 'plugin', plugin: 'other' } }],
+  })
+  assert.equal(out3.messages.length, 1, '内容未变不得重复注入')
+})
+
+test('画像热路径纪律：无缓存时不注入不阻塞（allowScan:false 的意义）', async () => {
+  const ctx = fakeCtx()
+  const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-profinj-n-'))
+  applyT(ctx, { mode: 'active', lcmRoot, memoryInjectMode: 'active' })
+  const session = fakeSession(lcmRoot, [])
+  const out = await runPreStepWithDecision(ctx, session, {
+    kind: 'run',
+    messages: [{ role: 'user', content: [{ type: 'text', text: '任意内容' }], source: { kind: 'user' } }],
+  })
+  assert.equal(out.messages.length, 1, '无画像缓存、无记忆命中 → 原样放行')
 })
