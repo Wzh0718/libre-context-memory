@@ -65,6 +65,8 @@ const DEFAULTS = {
   foldKeepLastTurns: 4,         // 最新 N 个对话节点永不折叠（活跃上下文）
   memoryInjectMode: 'shadow',  // 记忆注入单独模式：shadow 只记账；active 在请求尾部追加检索块（前缀安全）
   memoryInjectMaxEntries: 6,   // 注入块条目上限（预算纪律：注入自身不能成为体积源）
+  memoryQueryBlend: false,     // 查询混合会话画像：A/B 实测略降排序（见 memory.blendQuery 注释），默认关
+  memoryProfileInjectMaxEntries: 8, // 画像条目常驻段条目上限（字符预算另有 PROFILE_MAX_CHARS 封顶）
   // —— 静态层裁剪臂（system-prompt/assemble）——
   // 工具定义在 ordinal 1–73，是缓存前缀最前端：**会话中途改动 = 击穿整个前缀**。
   // 因此策略必须是「会话无关的确定性规则」（同输入必得同输出 → 天然稳定）。
@@ -778,5 +780,17 @@ export function apply(ctx, config = {}) {
 
   ctx.logger.info(`dsh-lcm loaded: mode=${cfg.mode} maxInlineChars=${cfg.maxInlineChars} pruneProactive=${cfg.pruneProactive} memoryInject=${cfg.memoryInjectMode}`)
   // 终端可见性：ctx.logger 不进 stdout，启动确认行直接 console（与其他 dsh 插件一致）
-  console.log(`[dsh-lcm] loaded, mode=${cfg.mode}, maxInlineChars=${cfg.maxInlineChars}, pruneProactive=${cfg.pruneProactive}, memoryInject=${cfg.memoryInjectMode}`)
+  // 启动自检：把「记忆/画像/折叠」的当前状态一次打出来（切 shadow→active 时要看这几项）
+  let startupStats = {}
+  try {
+    startupStats = {
+      entries: memory.activeEntries(meterBase).length,
+      profile: memory.profileEntries(meterBase).length,
+      foldMode: cfg.foldMode,
+      incremental: cfg.memoryExtractIncremental,
+      blend: cfg.memoryQueryBlend,
+    }
+  } catch { /* 记忆库不可读不阻塞启动 */ }
+  console.log(`[dsh-lcm] loaded, mode=${cfg.mode}, maxInlineChars=${cfg.maxInlineChars}, pruneProactive=${cfg.pruneProactive}, memoryInject=${cfg.memoryInjectMode}`
+    + `, memory=${startupStats.entries ?? '?'}条/画像${startupStats.profile ?? '?'}条, fold=${cfg.foldMode}, incremental=${cfg.memoryExtractIncremental}, queryBlend=${cfg.memoryQueryBlend}`)
 }
