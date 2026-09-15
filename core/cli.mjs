@@ -393,7 +393,7 @@ async function main() {
     if (sub === 'eval') {
       const ev = await import('./eval.mjs')
       const golden = ev.loadGolden(cfg, { rebuild: Boolean(args.rebuild) })
-      const r = ev.runEval(cfg, golden, { k: Number(args.k ?? ev.EVAL_K) })
+      const r = ev.runEval(cfg, golden, { k: Number(args.k ?? ev.EVAL_K), mode: args.mode ?? undefined })
       if (args.json) { console.log(JSON.stringify(r, null, 2)); return r.ok ? 0 : 1 }
       console.log(ev.renderEvalReport(r, golden))
       return r.ok ? 0 : 1

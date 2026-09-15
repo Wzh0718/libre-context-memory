@@ -272,3 +272,43 @@ test('显示去重：claim 已含 subject 信息时不重复拼接', () => {
   assert.ok(block.includes(e.claim))
   assert.ok(!block.includes(`${e.subject}：${e.claim}`), 'subject 为空不得拼出「：」前缀')
 })
+
+test('两层读分：默认模式（rel-quality-mild）性质与确定性', async () => {
+  const mem = await import('../memory.mjs')
+  const q = mem.tokensOf('记忆库 落盘 决定')
+  // 相关度为零 → 0（不参与排序）
+  assert.equal(mem.readScore({ subject: '完全无关', claim: '别的主题', ts: Date.now() }, q), 0)
+  // 质量高者 > 质量低者（同相关度）；且倍数有界 [0.7, 1.0]——不会让质量淹没相关度
+  const low = mem.readScore({ subject: '记忆库', claim: '落盘', score: 0.3, ts: 0 }, q)
+  const high = mem.readScore({ subject: '记忆库', claim: '落盘', score: 1.0, ts: 0 }, q)
+  assert.ok(high > low)
+  assert.ok(high / low <= 1 / 0.79 + 1e-9, 'quality 调制倍数必须有界')
+  // 同输入同输出（注入块逐字节稳定的前提）
+  const e = { subject: '记忆库', claim: '落盘 决定', score: 0.8, ts: 1700000000000 }
+  assert.equal(mem.readScore(e, q, { now: 1700000000000 }), mem.readScore(e, q, { now: 1700000000000 }))
+  // 默认模式就是评测选出的那个（防回退到直觉选择）
+  assert.equal(mem.DEFAULT_SCORE_MODE, 'rel-quality-mild')
+  // 画像加成作为独立因子（A3）：boost>1 提升，1 不变
+  const base = mem.readScore(e, q, { now: 1700000000000 })
+  assert.ok(mem.readScore(e, q, { now: 1700000000000, qualityBoost: 1.2 }) > base)
+})
+
+test('search：模式可选 + 结果确定性（同查询两次逐条相同）', async () => {
+  const mem = await import('../memory.mjs')
+  const { cfg, root } = (() => {
+    const r = mkdtempSync(join(tmpdir(), 'lcm-score-'))
+    const c = loadConfig(r, { meterRoot: join(r, '.lcm') })
+    mkdirSync(c.memoryDir, { recursive: true })
+    return { cfg: c, root: r }
+  })()
+  mem.record(cfg, { type: 'decision', subject: '读分模式', claim: '读分默认用 rel-quality-mild，由评测 A/B 选出', score: 0.9, source: 'manual' })
+  mem.record(cfg, { type: 'fact', subject: '读分模式', claim: '读分模式候选包括 two-layer 与 lexicographic', score: 0.4, source: 'manual' })
+  const a = mem.search(cfg, '读分模式 选择', { k: 5 })
+  const b = mem.search(cfg, '读分模式 选择', { k: 5 })
+  assert.deepEqual(a.map((e) => e.id), b.map((e) => e.id), '同查询必须确定')
+  assert.ok(a.length >= 2)
+  assert.ok(a[0].score >= 0.9, '质量高的条目应排前（同 subject 相关度下）')
+  // 指定模式仍然可用（A/B 与回归用）
+  const legacy = mem.search(cfg, '读分模式 选择', { k: 5, mode: 'legacy' })
+  assert.equal(legacy.length, a.length)
+})

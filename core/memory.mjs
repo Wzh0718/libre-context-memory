@@ -198,18 +198,73 @@ export function refute(cfg, { subject, claim, type = null }, { now = Date.now() 
  * 关键词检索（零依赖）：subject 命中 ×3、claim ×1、keywords ×0.5，时间新近度做次级排序。
  * @returns 预算内的 top-k 条目（带 score）
  */
-export function search(cfg, query, { k = 6, maxChars = 2_500 } = {}) {
+/** 读分权重：subject 命中远比 claim 命中重要；keyword 是弱信号。 */
+export const READ_WEIGHTS = { subject: 3, claim: 1, keyword: 0.5 }
+/** 读分模式（A/B 用）：default 由评测决定，不靠直觉。 */
+export const SCORE_MODES = ['legacy', 'rel', 'rel-quality', 'rel-quality-mild', 'rel-quality-sqrt', 'rel-recency', 'two-layer', 'lexicographic']
+// 默认模式由评测 A/B 决定（scripts/score-ab 结论，勿凭直觉改）：
+// rel-quality-mild 在跨会话 MRR 0.783 / top1 65.6% / recall 98.4% 三项全胜 baseline（0.781/63.9%/96.7%）；
+// 而 two-layer（饱和归一×三因子）显著变差（0.681/50.8%/95.1%）——归一化与多因子连乘都是噪声。
+export const DEFAULT_SCORE_MODE = 'rel-quality-mild'
+/** 质量因子下限：质量差可以降权，但不至于让条目彻底消失（召回优先）。 */
+const QUALITY_FLOOR = 0.3
+/** recency 半衰期（天）——只做温和调制，不让新条目无脑压过旧结论。 */
+const RECENCY_HALF_LIFE_DAYS = 30
+
+/**
+ * 两层读分（用户拍板）：readScore = relevance × quality × recency。
+ * - relevance：token 重叠饱和归一（rel/(rel+4)）——避免长条目靠字数刷分
+ * - quality：写分（TYPE_WEIGHT × signalDensity）作排序因子，下限 0.3
+ * - recency：有界衰减 [0.7, 1.0]——老条目降权但不淘汰
+ * 纯函数、确定性（同输入同输出），注入块逐字节稳定的前提。
+ */
+/** 原始相关度（未归一）：subject×3 + claim×1 + keyword×0.5。 */
+export function relevanceOf(e, q) {
+  let rel = 0
+  for (const t of tokensOf(e.subject)) if (q.has(t)) rel += READ_WEIGHTS.subject
+  for (const t of tokensOf(e.claim)) if (q.has(t)) rel += READ_WEIGHTS.claim
+  for (const w of e.keywords ?? []) if (q.has(String(w).toLowerCase())) rel += READ_WEIGHTS.keyword
+  return rel
+}
+
+export function readScore(e, q, { now = Date.now(), qualityBoost = 1, mode = DEFAULT_SCORE_MODE } = {}) {
+  const rel = relevanceOf(e, q)
+  if (rel <= 0) return 0
+  const rawQuality = typeof e.score === 'number' ? e.score : 0.6
+  const quality = Math.min(1, Math.max(QUALITY_FLOOR, rawQuality))
+  const ageDays = Math.max(0, (now - (e.ts ?? 0)) / 86_400_000)
+  const recency = 0.7 + 0.3 * 2 ** (-ageDays / RECENCY_HALF_LIFE_DAYS)
+  switch (mode) {
+    case 'rel': return rel
+    case 'rel-quality': return rel * quality * qualityBoost
+    case 'rel-quality-mild': return rel * (0.7 + 0.3 * quality) * qualityBoost   // 默认：温和调制
+    case 'rel-quality-sqrt': return rel * Math.sqrt(quality) * qualityBoost
+    case 'rel-recency': return rel * recency * qualityBoost
+    case 'two-layer': return (rel / (rel + 4)) * quality * recency * qualityBoost
+    case 'legacy':   // 旧口径：原始相关度 + 24h 内新鲜奖励 0.5
+    default:
+      return rel + (ageDays < 1 ? 0.5 : 0)
+  }
+}
+
+export function search(cfg, query, { k = 6, maxChars = 2_500, qualityBoostOf = null, mode = DEFAULT_SCORE_MODE } = {}) {
   const q = tokensOf(query)
   if (q.size === 0) return []
+  const now = Date.now()
   const scored = []
   for (const e of activeEntries(cfg)) {
-    let score = 0
-    for (const t of tokensOf(e.subject)) if (q.has(t)) score += 3
-    for (const t of tokensOf(e.claim)) if (q.has(t)) score += 1
-    for (const w of e.keywords ?? []) if (q.has(String(w).toLowerCase())) score += 0.5
-    if (score > 0) scored.push({ ...e, score: score + Math.min(1, (Date.now() - (e.ts ?? 0)) < 86_400_000 ? 0.5 : 0) })
+    const boost = qualityBoostOf ? qualityBoostOf(e) : 1      // 画像加成等外部因子
+    const score = readScore(e, q, { now, qualityBoost: boost, mode })
+    if (score > 0) scored.push({ ...e, score, _rel: relevanceOf(e, q) })
   }
-  scored.sort((a, b) => b.score - a.score || (b.ts ?? 0) - (a.ts ?? 0))
+  if (mode === 'lexicographic') {
+    // 相关度优先、质量次之——不做乘法混合（乘法在真实数据上被证明是噪声，见 score-ab）
+    scored.sort((a, b) => b._rel - a._rel
+      || (b.score ?? 0) - (a.score ?? 0)
+      || (b.ts ?? 0) - (a.ts ?? 0) || (a.id < b.id ? -1 : 1))
+  } else {
+    scored.sort((a, b) => b.score - a.score || (b.ts ?? 0) - (a.ts ?? 0) || (a.id < b.id ? -1 : 1))
+  }
   const out = []
   let used = 0
   for (const e of scored.slice(0, k)) {

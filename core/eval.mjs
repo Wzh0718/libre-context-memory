@@ -195,18 +195,25 @@ export function buildGolden(cfg, { sessionsDir, maxPerSession = 6, logLimit = 20
 }
 
 /** 跑评测。返回 {recall, hits, total, penetration, misses, penetrationDetails, byKind, ok}。 */
-export function runEval(cfg, golden, { k = EVAL_K } = {}) {
+export function runEval(cfg, golden, { k = EVAL_K, mode = memory.DEFAULT_SCORE_MODE } = {}) {
   const results = new Map()   // query → id 列表
   const queryIds = (q) => {
-    if (!results.has(q)) results.set(q, memory.search(cfg, q, { k }).map((e) => e.id))
+    if (!results.has(q)) results.set(q, memory.search(cfg, q, { k, mode }).map((e) => e.id))
     return results.get(q)
   }
   let hits = 0
   const misses = []
   const byKind = {}
+  const rankSum = { all: 0, n: 0, cross: 0, nCross: 0 }   // MRR 累加（1/rank，未命中记 0）
+  let top1 = { all: 0, cross: 0 }
   for (const p of golden.positives) {
     const ids = queryIds(p.query)
-    const hit = ids.includes(p.expectId)
+    const rank = ids.indexOf(p.expectId)          // -1 = 未命中
+    const hit = rank >= 0
+    const rr = hit ? 1 / (rank + 1) : 0
+    rankSum.all += rr; rankSum.n++
+    if (rank === 0) top1.all++
+    if (p.kind === 'cross') { rankSum.cross += rr; rankSum.nCross++; if (rank === 0) top1.cross++ }
     byKind[p.kind] ??= { total: 0, hits: 0 }
     byKind[p.kind].total++
     if (hit) { hits++; byKind[p.kind].hits++ } else {
@@ -231,9 +238,14 @@ export function runEval(cfg, golden, { k = EVAL_K } = {}) {
     : (sess.total >= MIN_SESSION_PAIRS
       ? { metric: 'session-pair', recall: Number((sess.hits / sess.total).toFixed(4)), total: sess.total }
       : { metric: 'overall', recall: recall === null ? null : Number(recall.toFixed(4)), total })
+  const mrr = rankSum.n === 0 ? null : Number((rankSum.all / rankSum.n).toFixed(4))
+  const mrrCross = rankSum.nCross === 0 ? null : Number((rankSum.cross / rankSum.nCross).toFixed(4))
+  const top1Rate = rankSum.n === 0 ? null : Number((top1.all / rankSum.n).toFixed(4))
+  const top1Cross = rankSum.nCross === 0 ? null : Number((top1.cross / rankSum.nCross).toFixed(4))
   return {
     k, total, hits,
     recall: recall === null ? null : Number(recall.toFixed(4)),
+    mrr, mrrCross, top1: top1Rate, top1Cross,
     primary,
     penetration: penetrationDetails.length,
     penetrationDetails: penetrationDetails.slice(0, 10),
@@ -271,6 +283,8 @@ export function renderEvalReport(r, golden) {
     + `（记忆库 ${golden.stats.live} 活跃 / ${golden.stats.dead} 已死）`)
   const pr = r.primary
   const prLabel = pr.metric === 'cross-session' ? '跨会话' : pr.metric === 'session-pair' ? '同会话' : '总体（配对样本不足）'
+  lines.push(`  排序质量：MRR ${r.mrr === null ? 'n/a' : r.mrr.toFixed(3)}（全）/ ${r.mrrCross === null ? 'n/a' : r.mrrCross.toFixed(3)}（跨会话）`
+    + ` ｜ top1 命中 ${r.top1 === null ? 'n/a' : (r.top1 * 100).toFixed(1) + '%'}（跨会话 ${r.top1Cross === null ? 'n/a' : (r.top1Cross * 100).toFixed(1) + '%'}）`)
   lines.push(`  主指标（${prLabel}）recall@${r.k}：`
     + `${pr.recall === null ? 'n/a' : (pr.recall * 100).toFixed(1) + '%'}（${pr.total} 条）`
     + ` ｜ 反例击穿：${r.penetration}`)
