@@ -20,6 +20,8 @@
         pruneMinChars: 4000     # 候选下限：摘要本身 ~1k 字符，太小的剪了没收益
         # —— 静态层裁剪臂（工具定义在请求最前端 → 会话中途改动会击穿前缀缓存，
         #    因此只做会话无关的确定性裁剪：同输入必得逐字节同输出）——
-        staticTrimMode: shadow      # 单独控制静态层裁剪臂：先 shadow，用 `lcm trim-diff` 复核后再切 active
+        # 2026-09-15 人工复核 trim-diff 后切 active（29/73 条被裁，省 54% 描述字符 ≈ 3.7k tok/请求）。
+        # 已知代价：MCP 工具（mcp__openviking 等）描述后段的参数文档会被首段优先规则裁掉——用户拍板接受。
+        staticTrimMode: active
         toolMaxDescriptionChars: 300 # 0=关；300 实测省 54% 描述字符
         dropToolFamilies: []         # 例：["mcp__openviking","mcp__dbx"]（整族不注入）

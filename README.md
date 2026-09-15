@@ -264,7 +264,7 @@ pruneProactive: false         # true=回到主动预算触发（默认关）
 bustThresholdTokens: 50000    # fresh 超过此值视为「前缀已冷」
 pruneMinChars: 4000           # 候选下限：摘要本身 ~1k 字符，太小的剪了没收益
 # —— 静态层裁剪臂 ——
-staticTrimMode: shadow        # 静态层裁剪臂单独的模式控制（描述降噪有削掉操作性规则的风险）
+staticTrimMode: active        # 2026-09-15 人工复核 trim-diff 后切 active；复核件随时重看：lcm trim-diff
 toolMaxDescriptionChars: 300  # 0 = 关闭描述降噪
 dropToolFamilies: []          # 例：["mcp__openviking"] 整族不注入
 ```
@@ -300,7 +300,7 @@ cd adapters/dsh && node --test test/*.test.js            # 适配器契约（伪
 
 - **缓存击穿的根治不在本项目范围**：前缀缓存由供应商/框架内部管理，插件只能「不为打穿它」并让被击穿的前缀尽量小；DSH 命中率本就健康（94%+）
 - **剪枝的真实代价**：① 模型需要细节时要多一次回取（摘要里带句柄/锚点/关键词，且最新一条不动）② 剪的那一轮会击穿一次前缀（已用冷却避免反复击穿）③ 界面/回放显示的是归档视图
-- **静态层描述降噪有风险**：部分工具描述把「必须这样做」写在第二段，裁剪可能削掉操作性规则 → 因此默认 shadow，需人工过一遍 diff 再切 active
+- **静态层描述降噪有风险**：部分工具描述把「必须这样做」写在第二段，裁剪可能削掉操作性规则 → 复核工具 `lcm trim-diff`（assemble 自动采集 before/after）就是为此而设；2026-09-15 人工复核后已切 active，已知代价：MCP 工具描述后段的参数文档会被首段优先规则裁掉（用户拍板接受）
 - **磁盘会增加而非减少**：原文落 spill（brotli 后约为原体积 1/26），靠 TTL + 容量上限控制
 - **默认搭便车剪枝**：`pruneProactive: false`，改写历史只在缓存本来就要失效时发生（`compaction/*` 后、观测到击穿后、subagent fork 首请求前），成本归零；主动路径仍保留给超长会话显式开启，但实测回本需要 ≥104 个后续请求
 - **计量数据曾按项目根分散**（会话 cwd + 服务器 cwd 两个落点，实测 85% 的事件落在 report 看不到的根）→ 已改为全局 `~/.lcm` 单根 + `project` 字段 + `lcm migrate` 一次性迁移；spill 原文仍按项目落盘
