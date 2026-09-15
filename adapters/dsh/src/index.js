@@ -462,7 +462,10 @@ export function apply(ctx, config = {}) {
       if (cfg.memoryInjectMode !== 'active' && cfg.memoryInjectMode !== 'shadow') return decision
       if (!decision || decision.kind === 'reject' || !Array.isArray(decision.messages)) return decision
       const sessionKey2 = agent?.session?.header?.id ?? 'unknown'
-      // 常驻画像块：只读缓存（allowScan:false——全量扫描是分钟级，绝不进请求热路径）
+      // 常驻画像块：只读缓存（allowScan:false——全量扫描是分钟级，绝不进请求热路径）。
+      // 自动刷新：画像过期（>6h）→ 后台 fire-and-forget 重扫最近 14 天窗口，
+      // 本次请求仍用旧缓存，下一次请求自动拿到新画像（无手动 refresh）。
+      profile.maybeAutoRefresh(meterBase)
       let profileBlock = null
       try {
         const prof = profile.getProfile(meterBase, { allowScan: false })

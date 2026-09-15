@@ -99,3 +99,44 @@ test('getProfile 热路径：过期缓存也返回（标 stale），不重扫', 
   assert.equal(p.stale, true)
   assert.equal(p.habit.sessions, 1)
 })
+
+test('自动刷新：节流 + 后台异步 + mtime 窗口', async () => {
+  const { cfg } = makeCfg()
+  const t0 = Date.now()
+  // 无缓存 → 触发（返回 promise，后台跑）
+  const r1 = profile.maybeAutoRefresh(cfg, { now: t0 })
+  assert.equal(r1.triggered, true)
+  assert.ok(r1.promise, '必须返回后台 promise（fire-and-forget）')
+  // 进行中再调 → in-flight 防并发
+  const r2 = profile.maybeAutoRefresh(cfg, { now: t0 + 1000 })
+  assert.deepEqual({ triggered: r2.triggered, reason: r2.reason }, { triggered: false, reason: 'in-flight' })
+  await r1.promise
+  // 完成后立刻再调：第一次刷新已写缓存（builtAt 新鲜）→ fresh 分支优先于 throttled
+  const r3 = profile.maybeAutoRefresh(cfg, { now: t0 + 2000 })
+  assert.deepEqual({ triggered: r3.triggered, reason: r3.reason }, { triggered: false, reason: 'fresh' })
+  // 缓存过期 + 距上次触发 <6h → throttled
+  const stale = { builtAt: t0 - 7 * 3600 * 1000, habit: { sessions: 1 }, behavior: null }
+  writeFileSync(join(cfg.meterDir, 'profile.json'), JSON.stringify(stale))
+  const r4 = profile.maybeAutoRefresh(cfg, { now: t0 + 3000 })
+  assert.deepEqual({ triggered: r4.triggered, reason: r4.reason }, { triggered: false, reason: 'throttled' })
+})
+
+test('增量窗口：sinceMs 只收最近文件，兜底全量', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { writeFileSync } = await import('node:fs')
+  const { sessionLogFiles } = await import('../recover.mjs')
+  const root = mkdtempSync(join(tmpdir(), 'lcm-since-'))
+  const dir = join(root, 'proj-x', 'sess-1')
+  mkdirSync(dir, { recursive: true })
+  const oldFile = join(dir, 'old.jsonl')
+  const newFile = join(dir, 'new.jsonl')
+  writeFileSync(oldFile, '{}\n')
+  writeFileSync(newFile, '{}\n')
+  const { utimesSync } = await import('node:fs')
+  utimesSync(oldFile, new Date('2020-01-01'), new Date('2020-01-01'))
+  const recent = sessionLogFiles(root, 200, { sinceMs: Date.now() - 1000 })
+  assert.equal(recent.length, 1, 'sinceMs 只收新文件')
+  assert.ok(recent[0].path.endsWith('new.jsonl'))
+  const all = sessionLogFiles(root, 200)
+  assert.equal(all.length, 2)
+})

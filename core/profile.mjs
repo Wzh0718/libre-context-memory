@@ -217,12 +217,45 @@ export function renderProfileBlock(cfg, { habit, behavior } = {}) {
   return block
 }
 
+// ---------------------------------------------------------------- 自动刷新（后台异步 + 节流）
+
+let lastAutoRefresh = 0
+let refreshInFlight = null
+
+/**
+ * 会话活动时的自动刷新入口（适配器每次注入前调用）：
+ * - 缓存新鲜（<6h）→ 什么都不做
+ * - 过期且空闲 → fire-and-forget 后台重扫（只扫最近 14 天窗口），下次请求用新画像
+ * - 正在刷 → 跳过（防并发）
+ * 热路径永远用当前缓存（哪怕 stale），零阻塞。
+ */
+export function maybeAutoRefresh(cfg, { now = Date.now() } = {}) {
+  if (refreshInFlight) return { triggered: false, reason: 'in-flight' }
+  const file = join(cfg.meterDir, 'profile.json')
+  let builtAt = 0
+  try {
+    if (existsSync(file)) builtAt = JSON.parse(readFileSync(file, 'utf8')).builtAt ?? 0
+  } catch { /* 损坏视为缺失 */ }
+  if (now - builtAt < AUTO_REFRESH_INTERVAL_MS) return { triggered: false, reason: 'fresh' }
+  if (now - lastAutoRefresh < AUTO_REFRESH_INTERVAL_MS) return { triggered: false, reason: 'throttled' }
+  lastAutoRefresh = now
+  refreshInFlight = getProfileAsync(cfg, { force: true, windowDays: AUTO_SCAN_DAYS })
+    .then(() => { refreshInFlight = null })
+    .catch(() => { refreshInFlight = null })
+  return { triggered: true, promise: refreshInFlight }
+}
+
 // ---------------------------------------------------------------- 缓存（不进热路径）
 
 const DAY_MS = 24 * 60 * 60 * 1000
+/** 自动刷新节流：最多每 6 小时一次（进程内）。 */
+export const AUTO_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000
+/** 自动刷新的扫描窗口：最近 14 天（习惯会漂移，老数据自然衰减）+ 至少 20 个会话兜底。 */
+export const AUTO_SCAN_DAYS = 14
+const AUTO_SCAN_MIN_SESSIONS = 20
 
 /** 画像计算入口：缓存按天刷新；force 或缓存缺失时全量重扫（分钟级，离线操作）。 */
-export function getProfile(cfg, { force = false, allowScan = true, sessionsDir, scanLimit = 400 } = {}) {
+export function getProfile(cfg, { force = false, allowScan = true, sessionsDir, scanLimit = 400, windowDays = 0 } = {}) {
   const file = join(cfg.meterDir, 'profile.json')
   try {
     if (existsSync(file)) {
@@ -233,11 +266,29 @@ export function getProfile(cfg, { force = false, allowScan = true, sessionsDir, 
   } catch { /* 缓存损坏 → 重算 */ }
   if (!allowScan) return null
 
+  const sessionTalks = collectSessionTalks(cfg, { sessionsDir, scanLimit, windowDays })
+  const profile = {
+    builtAt: Date.now(),
+    habit: habitProfile(sessionTalks),
+    behavior: behaviorProfile(cfg),
+  }
+  writeProfileCache(file, cfg, profile)
+  return profile
+}
+
+/** async 分片变体：每处理一个会话文件让出一次事件循环——后台自动刷新专用，
+ *  扫描期间新请求照常处理，不被 zstd 解压阻塞。 */
+export async function getProfileAsync(cfg, { sessionsDir, scanLimit = 400, windowDays = 0 } = {}) {
   const dir = sessionsDir ?? cfg.sessionsDir
-  const logs = sessionLogFiles(dir, scanLimit)
+  const windowSince = windowDays ? Date.now() - windowDays * DAY_MS : 0
+  let logs = sessionLogFiles(dir, scanLimit, { sinceMs: windowSince })
+  if (logs.length < AUTO_SCAN_MIN_SESSIONS && windowSince > 0) {
+    logs = sessionLogFiles(dir, scanLimit)   // 兜底同上
+  }
   const sessionTalks = []
   for (const log of logs) {
-    const logPath = typeof log === 'string' ? log : log.path   // sessionLogFiles 返回 {path, mtimeMs}
+    await new Promise((r) => setImmediate(r))   // 分片让出事件循环
+    const logPath = typeof log === 'string' ? log : log.path
     const talks = userTalksOf(logPath)
     if (talks.length > 0) {
       const project = logPath.split('/').at(-3)?.replace(/^--+|--+$/g, '').split('--').pop() ?? ''
@@ -249,9 +300,32 @@ export function getProfile(cfg, { force = false, allowScan = true, sessionsDir, 
     habit: habitProfile(sessionTalks),
     behavior: behaviorProfile(cfg),
   }
+  writeProfileCache(join(cfg.meterDir, 'profile.json'), cfg, profile)
+  return profile
+}
+
+function collectSessionTalks(cfg, { sessionsDir, scanLimit = 400, windowDays = 0 }) {
+  const dir = sessionsDir ?? cfg.sessionsDir
+  const windowSince = windowDays ? Date.now() - windowDays * DAY_MS : 0
+  let logs = sessionLogFiles(dir, scanLimit, { sinceMs: windowSince })
+  if (logs.length < AUTO_SCAN_MIN_SESSIONS && windowSince > 0) {
+    logs = sessionLogFiles(dir, scanLimit)
+  }
+  const sessionTalks = []
+  for (const log of logs) {
+    const logPath = typeof log === 'string' ? log : log.path   // sessionLogFiles 返回 {path, mtimeMs}
+    const talks = userTalksOf(logPath)
+    if (talks.length > 0) {
+      const project = logPath.split('/').at(-3)?.replace(/^--+|--+$/g, '').split('--').pop() ?? ''
+      sessionTalks.push({ project, talks })
+    }
+  }
+  return sessionTalks
+}
+
+function writeProfileCache(file, cfg, profile) {
   try {
     mkdirSync(cfg.meterDir, { recursive: true })
     writeFileSync(file, JSON.stringify(profile), 'utf8')
   } catch { /* 只读环境：内存返回 */ }
-  return profile
 }

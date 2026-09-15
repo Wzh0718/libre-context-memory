@@ -41,7 +41,8 @@ export function readSessionLog(path) {
 }
 
 /** 递归收集会话日志文件（.jsonl / .jsonl.zstd），按 mtime 从新到旧。 */
-export function sessionLogFiles(sessionsDir, limit = 200) {
+/** 收集会话日志，mtime 新→旧。sinceMs：只收更新于该时刻之后的文件（增量扫描窗口）。 */
+export function sessionLogFiles(sessionsDir, limit = 200, { sinceMs = 0 } = {}) {
   const out = []
   const walk = (dir, depth) => {
     if (depth > 3 || !existsSync(dir)) return
@@ -49,7 +50,10 @@ export function sessionLogFiles(sessionsDir, limit = 200) {
       const path = join(dir, name.name)
       if (name.isDirectory()) walk(path, depth + 1)
       else if (name.name.endsWith('.jsonl.zstd') || name.name.endsWith('.jsonl')) {
-        try { out.push({ path, mtimeMs: statSync(path).mtimeMs }) } catch { /* 忽略 */ }
+        try {
+          const mtimeMs = statSync(path).mtimeMs
+          if (mtimeMs >= sinceMs) out.push({ path, mtimeMs })
+        } catch { /* 忽略 */ }
       }
     }
   }
