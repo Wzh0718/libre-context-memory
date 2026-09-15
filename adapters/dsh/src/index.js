@@ -60,6 +60,9 @@ const DEFAULTS = {
   // —— 记忆臂（Phase 3：本地 ~/.lcm/memories + OpenViking 双写）——
   memoryExtract: true,         // compaction/summary → 确定性提取入库（搭 DSH 内置摘要便车，零 LLM 调用）
   memoryExtractIncremental: true, // 增量熔炼臂：pre-step 水位线扫新增 user/assistant 轮次提取入库
+  foldMode: 'shadow',           // warm folding：off|shadow|active——把已蒸馏旧轮次折叠成指针行（记忆替代 token）
+  foldMinChars: 200,            // 短于此不折（指针行本身有成本，折叠不划算）
+  foldKeepLastTurns: 4,         // 最新 N 个对话节点永不折叠（活跃上下文）
   memoryInjectMode: 'shadow',  // 记忆注入单独模式：shadow 只记账；active 在请求尾部追加检索块（前缀安全）
   memoryInjectMaxEntries: 6,   // 注入块条目上限（预算纪律：注入自身不能成为体积源）
   // —— 静态层裁剪臂（system-prompt/assemble）——
@@ -339,6 +342,62 @@ export function apply(ctx, config = {}) {
   // 直到低于 targetTokens（滞回带）。最新一条 tool/result 不动（当前推理要用）。
   // shadow 模式完整计算并记账，但不改写历史。任何异常 → 放行（next()）。
   /** 剪枝臂主体（独立函数：早退不影响注入流程）。 */
+  // ---- warm folding 折叠臂：把「已蒸馏至记忆库」的旧轮次折叠成指针行 ----
+  // 纪律：只折 seq ≤ 熔炼水位线的轮次（信息已在记忆库，折叠=替代而非丢失）；
+  // 只在冷窗口调用（piggyback）；最新 foldKeepLastTurns 轮永不折叠（活跃上下文）；
+  // 指针行替换走 surfaceOp replace——只改模型可见层，持久日志完好可回放。
+  const runFold = (agent, sessionKey) => {
+    if (cfg.foldMode === 'off') return
+    const session = agent?.session
+    if (!session?.surface || typeof session.append !== 'function') return
+    const watermark = extractWatermark.get(sessionKey) ?? -1
+    if (watermark < 0) return                        // 熔炼臂没跑过 → 无可折叠对象（安全默认）
+    const chatSeqs = [...session.surface.nodes]
+      .filter((seq) => {
+        if (seq > watermark) return false            // 未蒸馏的不折
+        const e = session.eventAt?.(seq)
+        return e?.type === 'user/message' || e?.type === 'assistant/message'
+      })
+      .sort((a, b) => a - b)
+    const keep = new Set(chatSeqs.slice(-cfg.foldKeepLastTurns))   // 最新 N 轮永不折叠
+    const isShadow = cfg.foldMode !== 'active'
+    let folded = 0, charsBefore = 0, charsAfter = 0
+    for (const seq of chatSeqs) {
+      if (keep.has(seq)) continue
+      const event = session.eventAt(seq)
+      const isUser = event.type === 'user/message'
+      if (isUser && event.data?.source?.kind !== 'user') continue  // 插件注入消息不折（本来也小）
+      const t = isUser ? flattenTextBlocks(event.data?.content) : flattenTextBlocks(event.data?.message?.content)
+      if (!t) continue
+      const chars = [...t].length
+      if (chars < cfg.foldMinChars) continue
+      const pointer = `[轮 ${seq}·${isUser ? 'user' : 'assistant'} 已蒸馏至记忆库；原文 ${chars} 字符在会话日志完好]`
+      folded++; charsBefore += chars; charsAfter += [...pointer].length
+      if (isShadow) continue
+      if (isUser) {
+        session.append('user/message', {
+          ...event.data,
+          content: [{ type: 'text', text: pointer }],
+          source: { kind: 'plugin', plugin: 'dsh-lcm', form: 'fold-pointer' },
+        }, { surfaceOp: { op: 'replace', start: seq, end: seq }, sourceEventSeqs: [seq] })
+      } else {
+        session.append('assistant/message', {
+          ...event.data,
+          message: { ...event.data.message, content: [{ type: 'text', text: pointer }] },
+        }, { surfaceOp: { op: 'replace', start: seq, end: seq }, sourceEventSeqs: [seq] })
+      }
+    }
+    if (folded === 0) return
+    meter.record(meterBase, {
+      kind: 'fold', sessionId: sessionKey, mode: cfg.foldMode,
+      nodes: folded, charsBefore, charsAfter,
+      savedTokens: Math.max(0, Math.ceil((charsBefore - charsAfter) / 2)),
+      watermark,
+      project: session.header?.cwd ?? null,
+    })
+    ctx.logger.info(`dsh-lcm ${isShadow ? '[shadow] ' : ''}fold: ${folded} 轮 ${charsBefore.toLocaleString()}→${charsAfter.toLocaleString()} 字符（已蒸馏至记忆库）`)
+  }
+
   const runPrune = async (agent) => {
 
       const session = agent?.session
@@ -381,6 +440,12 @@ export function apply(ctx, config = {}) {
       if (!piggybackOk && !proactiveOk) {
         coldSession.delete(sessionKey)
         return
+      }
+
+      if (piggybackOk) {
+        try { runFold(agent, sessionKey) } catch (error) {
+          ctx.logger.warn(`dsh-lcm: fold failed: ${String(error?.message ?? error)}; continuing`)
+        }
       }
 
       const candidates = []

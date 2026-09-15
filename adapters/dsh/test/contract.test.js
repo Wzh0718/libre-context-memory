@@ -64,7 +64,7 @@ function fakeSession(lcmRoot, entries) {
     append(type, data, opts) {
       appends.push({ type, data, opts })
       // 模拟真实 surface 替换：被替换的节点在 surface 上换成新内容
-      if (type === 'tool/result' && opts?.surfaceOp?.op === 'replace') {
+      if (opts?.surfaceOp?.op === 'replace') {
         const seq = opts.surfaceOp.start
         events.set(seq, { type, data, seq })
       }
@@ -739,4 +739,87 @@ test('增量熔炼臂：无新增轮次零副作用；关闭开关后完全停�
   ])
   await runPreStep(ctx, session)
   assert.ok(!existsSync(join(lcmRoot, '.lcm', 'memories')), '开关关闭不得产生记忆库')
+})
+
+// ---------------------------------------------------------------- warm folding 折叠臂
+
+const LONG_A = '这是一条足够长的用户消息，用来测试折叠臂的长度门槛。'.repeat(12)   // ~300 chars
+const LONG_B = '这是一段足够长的助手回复内容，包含分析过程与结论的详细展开说明。'.repeat(12)
+
+function foldSession(lcmRoot, n = 8) {
+  const entries = []
+  for (let i = 0; i < n; i++) entries.push(i % 2 === 0 ? userMsgEvent(LONG_A + i) : assistantMsgEvent(LONG_B + i))
+  return fakeSession(lcmRoot, entries)
+}
+
+test('折叠臂 shadow（默认）：冷窗口记账但不替换 surface', async () => {
+  const ctx = fakeCtx()
+  const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-fold-sh-'))
+  applyT(ctx, { mode: 'active', lcmRoot })
+  withTokenMeter(ctx, 150_000)
+  const session = foldSession(lcmRoot)
+  await runPreStep(ctx, session)                                  // 建熔炼水位线
+  emitSessionEvent(ctx, session, { type: 'compaction/basic' })    // 打开冷窗口
+  await runPreStep(ctx, session)
+  const folds = readMeterEvents(lcmRoot, 'fold')
+  assert.equal(folds.length, 1, '冷窗口应记一次 fold')
+  assert.equal(folds[0].mode, 'shadow')
+  assert.equal(folds[0].nodes, 4, '8 轮 - 最新 4 轮 = 可折 4 轮')
+  assert.ok(folds[0].savedTokens > 0)
+  assert.equal(session.appends.length, 0, 'shadow 不得改写 surface')
+})
+
+test('折叠臂 active：指针行替换 + 最新 4 轮保留 + 短消息与插件消息不折', async () => {
+  const ctx = fakeCtx()
+  const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-fold-act-'))
+  applyT(ctx, { mode: 'active', lcmRoot, foldMode: 'active' })
+  withTokenMeter(ctx, 150_000)
+  const entries = [
+    userMsgEvent(LONG_A),                          // seq1 可折
+    assistantMsgEvent(LONG_B),                     // seq2 可折
+    userMsgEvent('短消息'),                          // seq3 太短不折
+    userMsgEvent(LONG_A + '插件注入版本', 'plugin'),  // seq4 插件消息不折
+    assistantMsgEvent(LONG_B + '甲'),                // seq5 可折
+    userMsgEvent(LONG_A + '乙'),                    // seq6 可折
+    assistantMsgEvent(LONG_B + '丙'), userMsgEvent(LONG_A + '丁'),  // seq7-10 最新 4 轮保留
+    assistantMsgEvent(LONG_B + '戊'), userMsgEvent(LONG_A + '己'),
+  ]
+  const session = fakeSession(lcmRoot, entries)
+  await runPreStep(ctx, session)                                  // 水位线 = 10
+  emitSessionEvent(ctx, session, { type: 'compaction/basic' })
+  await runPreStep(ctx, session)
+
+  const foldAppends = session.appends.filter((a) => a.opts?.surfaceOp?.op === 'replace')
+  assert.equal(foldAppends.length, 4, 'seq 1/2/5/6 应折叠（3 太短、4 插件、7-10 保留）')
+  const foldedSeqs = foldAppends.map((a) => a.opts.surfaceOp.start).sort((a, b) => a - b)
+  assert.deepEqual(foldedSeqs, [1, 2, 5, 6])
+  for (const a of foldAppends) {
+    const text = a.type === 'user/message' ? a.data.content[0].text : a.data.message.content[0].text
+    assert.ok(/^\[轮 \d+·(user|assistant) 已蒸馏至记忆库/.test(text), '必须是指针行')
+    if (a.type === 'user/message') {
+      assert.equal(a.data.source.kind, 'plugin', '指针行不得伪装成真人消息（防熔炼/检索误回收）')
+    }
+  }
+  const fold = readMeterEvents(lcmRoot, 'fold')[0]
+  assert.equal(fold.mode, 'active')
+  assert.equal(fold.nodes, 4)
+  // 折叠后重跑：surface 上已是指针行（<200 chars）→ 零可折对象 → 不再重复折叠、
+  // 也不记账（无操作不产生噪音事件）
+  emitSessionEvent(ctx, session, { type: 'compaction/basic' })
+  await runPreStep(ctx, session)
+  assert.equal(readMeterEvents(lcmRoot, 'fold').length, 1, '无可折对象的冷窗口不得记账')
+  assert.equal(session.appends.filter((a) => a.opts?.surfaceOp?.op === 'replace').length, 4, '不得二次替换')
+})
+
+test('折叠臂安全默认：熔炼臂关闭（无水位线）→ 冷窗口也不折叠', async () => {
+  const ctx = fakeCtx()
+  const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-fold-off-'))
+  applyT(ctx, { mode: 'active', lcmRoot, foldMode: 'active', memoryExtractIncremental: false })
+  withTokenMeter(ctx, 150_000)
+  const session = foldSession(lcmRoot)
+  await runPreStep(ctx, session)
+  emitSessionEvent(ctx, session, { type: 'compaction/basic' })
+  await runPreStep(ctx, session)
+  assert.equal(readMeterEvents(lcmRoot, 'fold').length, 0, '无水位线 = 无蒸馏依据 = 绝不折叠')
+  assert.equal(session.appends.length, 0)
 })
