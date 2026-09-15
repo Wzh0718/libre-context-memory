@@ -68,6 +68,24 @@ export function loadConfig(root = findRoot(), { meterRoot } = {}) {
       if (typeof data.sessions_dir === 'string') cfg.sessionsDir = data.sessions_dir
     } catch { /* 配置损坏不致命：降级本地 */ }
   }
+  // 凭据兜底：复用 ov CLI 的配置文件（~/.openviking/ovcli.conf，{url, api_key}），
+  // 不复制密钥、零额外配置——装了 ov 的机器上 lcm 自动获得 OpenViking 同步能力。
+  if (!cfg.openvikingUrl || !cfg.openvikingApiKey) {
+    const ovcli = join(homedir(), '.openviking', 'ovcli.conf')
+    if (existsSync(ovcli)) {
+      try {
+        const data = JSON.parse(readFileSync(ovcli, 'utf8'))
+        cfg.openvikingUrl = cfg.openvikingUrl || (typeof data.url === 'string' ? data.url : null)
+        cfg.openvikingApiKey = cfg.openvikingApiKey || (typeof data.api_key === 'string' ? data.api_key : null)
+      } catch { /* 损坏静默 */ }
+    }
+  }
+  // 测试密封性开关：LCM_OPENVIKING_DISABLED=1 强制视为未配置
+  // （ovcli.conf 兜底会让装了 ov 的机器上所有测试意外「已配置」并发真实网络请求）
+  if (process.env.LCM_OPENVIKING_DISABLED === '1') {
+    cfg.openvikingUrl = null
+    cfg.openvikingApiKey = null
+  }
   cfg.openvikingConfigured = Boolean(cfg.openvikingUrl && cfg.openvikingApiKey)
   cfg.localDir = join(root, '.lcm')
   cfg.spillDir = join(cfg.localDir, 'spill')
@@ -75,5 +93,7 @@ export function loadConfig(root = findRoot(), { meterRoot } = {}) {
   cfg.meterDir = findMeterRoot(meterRoot)
   cfg.legacyMeterDir = cfg.localDir
   cfg.meterFile = join(cfg.meterDir, 'meter.jsonl')
+  // 记忆库：同样全局（~/.lcm/memories）——记忆是用户级资产，不按项目分割
+  cfg.memoryDir = join(cfg.meterDir, 'memories')
   return cfg
 }

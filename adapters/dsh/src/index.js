@@ -26,6 +26,7 @@ import { createHash } from 'node:crypto'
 import { compress } from '../../../core/compress.mjs'
 import { loadConfig } from '../../../core/config.mjs'
 import * as meter from '../../../core/meter.mjs'
+import * as memory from '../../../core/memory.mjs'
 import * as spill from '../../../core/spill.mjs'
 
 export const name = 'dsh-lcm'
@@ -55,6 +56,10 @@ const DEFAULTS = {
   //   实测窗口默认开导致净负 3.2%）。
   pruneProactive: false,
   bustThresholdTokens: 50_000, // fresh 超过此值视为「前缀已冷」
+  // —— 记忆臂（Phase 3：本地 ~/.lcm/memories + OpenViking 双写）——
+  memoryExtract: true,         // compaction/summary → 确定性提取入库（搭 DSH 内置摘要便车，零 LLM 调用）
+  memoryInjectMode: 'shadow',  // 记忆注入单独模式：shadow 只记账；active 在请求尾部追加检索块（前缀安全）
+  memoryInjectMaxEntries: 6,   // 注入块条目上限（预算纪律：注入自身不能成为体积源）
   // —— 静态层裁剪臂（system-prompt/assemble）——
   // 工具定义在 ordinal 1–73，是缓存前缀最前端：**会话中途改动 = 击穿整个前缀**。
   // 因此策略必须是「会话无关的确定性规则」（同输入必得同输出 → 天然稳定）。
@@ -208,6 +213,7 @@ export function apply(ctx, config = {}) {
   const pruneArmedAt = new Map()   // sessionId → 下一次允许剪枝的 token 水位
   const coldSession = new Set()    // 刚发生 compaction/击穿 → 下次 pre-step 可免费改写历史
   const preStepSeen = new Set()    // 已经历过 pre-step 的会话（继承冷启动窗口只在首个 pre-step 有效）
+  const lastInjectDigest = new Map() // sessionId → 上次注入的条目 digest（内容没变不重复注入）
   // 计量统一落全局根（默认 ~/.lcm，LCM_METER_ROOT / cordis 配置可覆盖），
   // 事件带 project 字段（会话 cwd）——此前按会话 cwd + 服务器 cwd 分散落点，
   // report/compare 只能看到一个项目的零头数据（实测 85% 的事件落在别的根）。
@@ -321,31 +327,32 @@ export function apply(ctx, config = {}) {
   // 把当前 surface 里的 tool/result 按字符数降序批量替换为「摘要+句柄」，
   // 直到低于 targetTokens（滞回带）。最新一条 tool/result 不动（当前推理要用）。
   // shadow 模式完整计算并记账，但不改写历史。任何异常 → 放行（next()）。
-  ctx.on('agent/pre-step', async ({ agent }, next) => {
-    try {
+  /** 剪枝臂主体（独立函数：早退不影响注入流程）。 */
+  const runPrune = async (agent) => {
+
       const session = agent?.session
       // ctx.get() 免 inject 读取：cordis 对未声明 inject 的服务属性访问会抛错
       // （实测：ctx.tokenMeter 抛 "cannot get property without inject"，被 try/catch 吞掉
       //  → 剪枝臂静默失效）。用 ctx.get 既不硬依赖该服务，也不误伤启动。
       const tokenMeter = ctx.get?.('tokenMeter')
-      if (!session?.surface || typeof session.append !== 'function') return next()
+      if (!session?.surface || typeof session.append !== 'function') return
       if (!tokenMeter) {
         if (!warnedNoMeter) {
           warnedNoMeter = true
           ctx.logger.warn('dsh-lcm: tokenMeter 不可用，剪枝臂停用（压缩与观测臂不受影响）')
           console.warn('[dsh-lcm] tokenMeter 不可用，剪枝臂停用')
         }
-        return next()
+        return
       }
       const measurement = tokenMeter.measure(session)
-      if (!measurement) return next()
+      if (!measurement) return
       const sessionKey = session.header?.id ?? 'unknown'
       const firstPreStep = !preStepSeen.has(sessionKey)
       preStepSeen.add(sessionKey)
       const armedAt = pruneArmedAt.get(sessionKey)
       if (armedAt !== undefined && measurement.totalTokens < armedAt) {
         coldSession.delete(sessionKey) // 冷却中，错过本次免费窗口也不保留
-        return next()
+        return
       }
 
       const isCold = coldSession.has(sessionKey)
@@ -362,7 +369,7 @@ export function apply(ctx, config = {}) {
       const proactiveOk = cfg.pruneProactive && measurement.totalTokens > cfg.budgetTokens
       if (!piggybackOk && !proactiveOk) {
         coldSession.delete(sessionKey)
-        return next()
+        return
       }
 
       const candidates = []
@@ -376,7 +383,7 @@ export function apply(ctx, config = {}) {
         if (chars <= cfg.pruneMinChars) continue
         candidates.push({ seq, event, result, text, chars })
       }
-      if (candidates.length === 0) return next()
+      if (candidates.length === 0) return
 
       candidates.sort((a, b) => b.chars - a.chars)          // 最大者优先
       const freshestSeq = Math.max(...candidates.map((c) => c.seq))
@@ -389,7 +396,7 @@ export function apply(ctx, config = {}) {
         picks.push(c)
         savedTokens += Math.ceil(c.chars / 2)               // 保守 ≈2 字符/token
       }
-      if (picks.length === 0) return next()
+      if (picks.length === 0) return
 
       const lcmRoot = cfg.lcmRoot ?? session.header?.cwd ?? process.cwd()
       const lcmCfg = loadConfig(lcmRoot)
@@ -438,11 +445,66 @@ export function apply(ctx, config = {}) {
         `dsh-lcm ${isShadow ? '[shadow] ' : ''}prune: ${picks.length} 节点 ${charsBefore.toLocaleString()}→${charsAfter.toLocaleString()} 字符`
         + `（压力 ${measurement.totalTokens.toLocaleString()} > 预算 ${cfg.budgetTokens.toLocaleString()}）`,
       )
+  }
+
+  ctx.on('agent/pre-step', async ({ agent }, next) => {
+    try {
+      await runPrune(agent)
     } catch (error) {
       ctx.logger.warn(`dsh-lcm: prune failed: ${String(error?.message ?? error)}; continuing the turn`)
     }
-    return next()
+    // ---- 记忆注入（拿住 decision，请求尾部追加稳定块；同 dsh-time-context 的注入模式）----
+    // 纪律：尾部追加绝不插中间（前缀安全）；digest 没变不重复注入（注入自身不能成为体积源）；
+    // 检索查询 = 最近一条真实用户消息（当前任务意图）。
+    const decision = await next()
+    try {
+      if (cfg.memoryInjectMode !== 'active' && cfg.memoryInjectMode !== 'shadow') return decision
+      if (!decision || decision.kind === 'reject' || !Array.isArray(decision.messages)) return decision
+      const sessionKey2 = agent?.session?.header?.id ?? 'unknown'
+      const query = lastUserQuery(decision.messages)
+      if (!query) return decision
+      const entries = memory.search(meterBase, query, { k: cfg.memoryInjectMaxEntries })
+      if (entries.length === 0) return decision
+      const digest = createHash('sha256').update(entries.map((e) => e.id).join(',')).digest('hex').slice(0, 12)
+      if (lastInjectDigest.get(sessionKey2) === digest) return decision   // 内容没变，不重复注入
+      lastInjectDigest.set(sessionKey2, digest)
+      const block = memory.renderInjectBlock(query, entries)
+      meter.record(meterBase, {
+        kind: 'memory-inject', mode: cfg.memoryInjectMode,
+        query: query.slice(0, 80), entries: entries.length, chars: [...block].length,
+        sessionId: sessionKey2, project: agent?.session?.header?.cwd ?? null,
+      })
+      if (cfg.memoryInjectMode === 'shadow') {
+        ctx.logger.info(`dsh-lcm [shadow] memory-inject: ${entries.length} 条（${query.slice(0, 40)}…，未注入）`)
+        return decision
+      }
+      ctx.logger.info(`dsh-lcm memory-inject: ${entries.length} 条（${query.slice(0, 40)}…）`)
+      return {
+        ...decision,
+        messages: [...decision.messages, {
+          role: 'user',
+          content: [{ type: 'text', text: block }],
+          source: { kind: 'plugin', plugin: 'dsh-lcm', form: 'snapshot', sections: [{ name: 'lcm-memory', text: block }] },
+        }],
+      }
+    } catch (error) {
+      ctx.logger.warn(`dsh-lcm: memory-inject failed: ${String(error?.message ?? error)}; keeping decision`)
+      return decision
+    }
   }, { prepend: true })
+
+  /** 最近一条真实用户消息文本（跳过插件注入的 snapshot），做检索查询。 */
+  function lastUserQuery(messages) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i]
+      if (m?.role !== 'user') continue
+      if (m?.source?.kind === 'plugin') continue   // 自己/别人的注入块不是用户意图
+      const block = Array.isArray(m?.content) ? m.content.find((b) => b?.type === 'text' && typeof b.text === 'string') : null
+      if (block && block.text.trim()) return block.text.trim().slice(0, 400)
+      return null
+    }
+    return null
+  }
 
   ctx.on('session/event', (session, event) => {
     try {
@@ -474,11 +536,41 @@ export function apply(ctx, config = {}) {
           shadowedTokens: event?.data?.shadowedTokenCount ?? null,
           project: session?.header?.cwd ?? null,
         })
+        // 记忆提取臂：搭 DSH 内置摘要的便车——compaction/summary 的产物已经是
+        // LLM 蒸馏过的结构化 markdown，确定性提取器零成本挑出记忆候选入库。
+        if (type === 'compaction/summary' && cfg.memoryExtract) {
+          try {
+            const text = (Array.isArray(event?.data?.summary) ? event.data.summary : [])
+              .map((b) => (typeof b?.text === 'string' ? b.text : '')).join('\n')
+            const cands = memory.extractCandidates(text)
+            let stored = 0; let idem = 0; let blocked = 0
+            for (const c of cands) {
+              const r = memory.record(meterBase, {
+                ...c, source: 'compaction/summary',
+                sessionId, project: session?.header?.cwd ?? null,
+              })
+              if (r.action === 'ADD' || r.action === 'UPDATE') stored++
+              else if (r.action === 'NOOP') idem++
+              else blocked++
+            }
+            if (cands.length > 0) {
+              ctx.logger.info(
+                `dsh-lcm memory: 从折叠摘要提取 ${cands.length} 条（入库 ${stored}，幂等 ${idem}，禁写 ${blocked}）`,
+              )
+            }
+            // 配置了 OpenViking：顺手冲 outbox（异步、失败静默——本地库才是 source of truth）
+            if (meterBase.openvikingConfigured) {
+              memory.flushOutbox(meterBase).catch(() => {})
+            }
+          } catch (error) {
+            ctx.logger.warn(`dsh-lcm: memory extract failed: ${String(error?.message ?? error)}`)
+          }
+        }
       }
     } catch { /* 观测臂失败静默 */ }
   })
 
-  ctx.logger.info(`dsh-lcm loaded: mode=${cfg.mode} maxInlineChars=${cfg.maxInlineChars} pruneProactive=${cfg.pruneProactive}`)
+  ctx.logger.info(`dsh-lcm loaded: mode=${cfg.mode} maxInlineChars=${cfg.maxInlineChars} pruneProactive=${cfg.pruneProactive} memoryInject=${cfg.memoryInjectMode}`)
   // 终端可见性：ctx.logger 不进 stdout，启动确认行直接 console（与其他 dsh 插件一致）
-  console.log(`[dsh-lcm] loaded, mode=${cfg.mode}, maxInlineChars=${cfg.maxInlineChars}, pruneProactive=${cfg.pruneProactive}`)
+  console.log(`[dsh-lcm] loaded, mode=${cfg.mode}, maxInlineChars=${cfg.maxInlineChars}, pruneProactive=${cfg.pruneProactive}, memoryInject=${cfg.memoryInjectMode}`)
 }

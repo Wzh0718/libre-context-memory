@@ -206,6 +206,12 @@ async function main() {
       }
     }
     console.log(`回取事件 ${s.retrieveCount} 次（涉及 ${s.retrieveHandles} 个句柄）`)
+    if (s.memory && (s.memory.stored || s.memory.injects)) {
+      const m = s.memory
+      console.log(`记忆事件：入库 ${m.stored} ｜ 幂等 ${m.noop} ｜ 禁写 ${m.rejected} ｜ 证伪 ${m.refuted}`
+        + ` ｜ 注入 ${m.injects} 次（影子 ${m.injectShadow}，累计 ${m.injectChars.toLocaleString()} 字符）`
+        + (m.syncOk || m.syncFail ? ` ｜ 同步 ok:${m.syncOk} fail:${m.syncFail}` : ''))
+    }
     const u = spill.usage(cfg)
     const cap = (cfg.spillMaxBytes / 1024 / 1024).toFixed(0)
     console.log(`spill 存储：${u.files} 个文件 / ${(u.bytes / 1024 / 1024).toFixed(1)} MB（上限 ${cap} MB，保留 ${cfg.spillTtlDays} 天）`
@@ -337,7 +343,62 @@ async function main() {
     return failed.length > 0 ? 1 : 0
   }
 
-  console.error('用法: lcm <compress|read|recover|report|compare|sweep|stat|trim-diff|migrate>')
+  if (cmd === 'memory') {
+    const mem = await import('./memory.mjs')
+    const sub = args._[0] ?? 'stats'
+    if (sub === 'add') {
+      if (!args.claim) { console.error('用法: lcm memory add --type fact --subject <主题> --claim <内容> [--keywords a,b]'); return 2 }
+      const r = mem.record(cfg, {
+        type: args.type ?? 'fact', subject: args.subject ?? 'manual', claim: args.claim,
+        keywords: args.keywords ? String(args.keywords).split(',').map((s) => s.trim()).filter(Boolean) : [],
+        source: 'manual',
+      })
+      console.log(`[lcm] ${r.action}${r.reason ? `（${r.reason}）` : ''}${r.id ? ` id=${r.id}` : ''}`)
+      if (cfg.openvikingConfigured) await mem.flushOutbox(cfg).catch(() => {})
+      return r.action === 'REJECT' ? 1 : 0
+    }
+    if (sub === 'list') {
+      const all = args.all ? mem.loadAll(cfg) : mem.activeEntries(cfg)
+      const rows = args.type ? all.filter((e) => e.type === args.type) : all
+      for (const e of rows) {
+        const date = new Date(e.ts ?? 0).toISOString().slice(0, 10)
+        const flag = e.superseded_by ? '（已取代）' : ''
+        console.log(`${date} [${e.type}] ${e.subject}：${e.claim}${flag}  (${e.id})`)
+      }
+      console.error(`[lcm] ${rows.length} 条${args.all ? '（含历史）' : ''}`)
+      return 0
+    }
+    if (sub === 'search' || sub === 'inject') {
+      if (!args.query) { console.error('用法: lcm memory search --query <查询> [--k 6]'); return 2 }
+      const hits = mem.search(cfg, args.query, { k: Number(args.k ?? 6) })
+      if (sub === 'search') {
+        for (const e of hits) console.log(`[${e.type}] ${e.subject}：${e.claim}  (score ${e.score.toFixed(1)}, ${e.id})`)
+        console.error(`[lcm] ${hits.length} 条命中`)
+        return 0
+      }
+      const block = mem.renderInjectBlock(args.query, hits)
+      if (!block) { console.error('[lcm] 无命中，无注入块'); return 0 }
+      console.log(block)
+      return 0
+    }
+    if (sub === 'sync') {
+      const r = await mem.flushOutbox(cfg)
+      console.log(`[lcm] 同步完成：发送 ${r.sent} 条，积压 ${r.remaining} 条${r.reason ? `（${r.reason}）` : ''}`)
+      return r.remaining > 0 ? 1 : 0
+    }
+    // stats（默认）
+    const all = mem.loadAll(cfg)
+    const live = mem.activeEntries(cfg)
+    const byType = {}
+    for (const e of live) byType[e.type] = (byType[e.type] ?? 0) + 1
+    console.log(`记忆库：${cfg.memoryDir}`)
+    console.log(`  有效 ${live.length} 条 / 历史 ${all.length} 行${Object.keys(byType).length ? ' ｜ ' + Object.entries(byType).map(([t, n]) => `${t}×${n}`).join(' ') : ''}`)
+    console.log(`  OpenViking：${cfg.openvikingConfigured ? `已配置（${cfg.openvikingUrl}，账号 ${cfg.openvikingAccount}）` : '未配置（本地库为唯一副本）'}`)
+    console.log(`  同步积压：${mem.outboxPending(cfg).length} 条（lcm memory sync 冲账）`)
+    return 0
+  }
+
+  console.error('用法: lcm <compress|read|recover|report|compare|sweep|stat|trim-diff|migrate|memory>')
   return 2
 }
 

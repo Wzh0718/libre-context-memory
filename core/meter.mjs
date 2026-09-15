@@ -67,6 +67,9 @@ export function summary(cfg, { project } = {}) {
   const compactions = filtered.filter((e) => e.kind === 'compaction')
   const prunes = filtered.filter((e) => e.kind === 'prune')
   const trims = filtered.filter((e) => e.kind === 'static-trim')
+  const memEvents = filtered.filter((e) => e.kind === 'memory')
+  const memInjects = filtered.filter((e) => e.kind === 'memory-inject')
+  const memSyncs = filtered.filter((e) => e.kind === 'memory-sync')
   const byType = new Map()
   for (const e of compress) {
     const k = `${e.backend === 'shadow' ? 'shadow:' : ''}${e.type ?? '?'}`
@@ -137,5 +140,16 @@ export function summary(cfg, { project } = {}) {
     })).sort((a, b) => b.orig - a.orig),
     retrieveCount: retrieves.length,
     retrieveHandles: new Set(retrieves.map((e) => e.spillId)).size,
+    memory: {
+      stored: memEvents.filter((e) => e.action === 'ADD' || e.action === 'UPDATE').length,
+      noop: memEvents.filter((e) => e.action === 'NOOP').length,
+      rejected: memEvents.filter((e) => e.action === 'REJECT').length,
+      refuted: memEvents.filter((e) => e.action === 'DELETE').length,
+      injects: memInjects.length,
+      injectShadow: memInjects.filter((e) => e.mode === 'shadow').length,
+      injectChars: memInjects.reduce((a, e) => a + (e.chars ?? 0), 0),
+      syncOk: memSyncs.filter((e) => e.ok).length,
+      syncFail: memSyncs.filter((e) => !e.ok).length,
+    },
   }
 }

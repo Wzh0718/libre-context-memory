@@ -18,6 +18,10 @@
         pruneProactive: false   # true=回到主动预算触发（默认关：实测净负 3.2%）
         bustThresholdTokens: 50000 # fresh 超过此值视为「前缀已冷」
         pruneMinChars: 4000     # 候选下限：摘要本身 ~1k 字符，太小的剪了没收益
+        # —— 记忆臂（Phase 3：本地 ~/.lcm/memories + OpenViking 双写同步）——
+        memoryExtract: true       # compaction/summary → 确定性提取入库（搭 DSH 内置摘要便车，零 LLM）
+        memoryInjectMode: shadow  # shadow 只记账；active 在请求尾部追加检索块（复核 shadow 期数据后切）
+        memoryInjectMaxEntries: 6 # 注入块条目上限（注入自身不能成为体积源）
         # —— 静态层裁剪臂（工具定义在请求最前端 → 会话中途改动会击穿前缀缓存，
         #    因此只做会话无关的确定性裁剪：同输入必得逐字节同输出）——
         # 2026-09-15 人工复核 trim-diff 后切 active（29/73 条被裁，省 54% 描述字符 ≈ 3.7k tok/请求）。

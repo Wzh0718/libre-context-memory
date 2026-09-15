@@ -6,6 +6,9 @@ import { mkdtempSync, readdirSync, readFileSync, existsSync, statSync } from 'no
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+// 测试密封：绝不读真实 ~/.openviking / ~/.config（ovcli 兜底会发真实网络请求）
+process.env.LCM_OPENVIKING_DISABLED = '1'
+
 import { apply } from '../src/index.js'
 import { loadConfig as loadConfigRaw } from '../../../core/config.mjs'
 import { read as spillRead, usage as spillUsage } from '../../../core/spill.mjs'
@@ -482,4 +485,117 @@ test('trim-diff 复核工件：assemble 自动落盘 + 内容寻址节流', asyn
   const trims = readMeterEvents(lcmRoot, 'static-trim')
   assert.equal(trims.length, 2)   // 两次 assemble 各记一次
   assert.equal(trims[0].project, null)
+})
+
+// ---------------------------------------------------------------- 记忆臂（Phase 3）
+
+const SUMMARY_EVENT = {
+  type: 'compaction/summary',
+  data: {
+    summary: [{ type: 'text', text: `## Primary Request and Intent
+- Original goal: 通过 dsh 采集 session 数据，研究 memory 管理
+- 下一步：验证记忆注入的检索质量
+
+## Key Technical Concepts
+- 记忆库位置 /home/libre/.lcm/memories 全局共享
+- 决定：本地库为 source of truth，OpenViking 只做同步副本` }],
+  },
+}
+
+async function runPreStepWithDecision(ctx, session, decision) {
+  const { fn } = ctx.listeners.find((l) => l.event === 'agent/pre-step')
+  return fn({ agent: { session } }, async () => decision)
+}
+
+test('记忆提取臂：compaction/summary → 确定性提取入库 + meter 记账', async () => {
+  const ctx = fakeCtx()
+  const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-memext-'))
+  applyT(ctx, { mode: 'active', lcmRoot })
+  const session = { header: { id: 'sess-mem', cwd: lcmRoot } }
+  emitSessionEvent(ctx, session, SUMMARY_EVENT)
+
+  const { activeEntries } = await import('../../../core/memory.mjs')
+  const live = activeEntries(lcfg(lcmRoot))
+  assert.ok(live.length >= 3, `应有提取产出（实际 ${live.length}）`)
+  assert.ok(live.every((e) => e.source === 'compaction/summary'))
+  assert.ok(live.some((e) => e.type === 'open_thread'), '「下一步」→ open_thread')
+  assert.ok(live.some((e) => e.type === 'fact' || e.type === 'decision'))
+  // meter 有 memory 事件
+  const mem = readMeterEvents(lcmRoot, 'memory')
+  assert.ok(mem.length >= 3)
+  // 重放同一 summary：全部幂等，不重复入库
+  emitSessionEvent(ctx, session, SUMMARY_EVENT)
+  assert.equal(activeEntries(lcfg(lcmRoot)).length, live.length, '重放必须幂等')
+})
+
+test('记忆注入臂 active：请求尾部追加 plugin 消息 + digest 节流', async () => {
+  const ctx = fakeCtx()
+  const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-meminj-'))
+  applyT(ctx, { mode: 'active', lcmRoot, memoryInjectMode: 'active' })
+  const { record } = await import('../../../core/memory.mjs')
+  record(lcfg(lcmRoot), { type: 'fact', subject: '记忆库根', claim: '记忆统一存 ~/.lcm/memories，按类型分文件' })
+  record(lcfg(lcmRoot), { type: 'decision', subject: '记忆同步', claim: '配置 OpenViking 后记忆双写同步到云端副本' })
+
+  const session = fakeSession(lcmRoot, [])
+  session.header = { ...session.header }
+  const base = {
+    kind: 'run',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: '记忆库 存在哪里，同步策略是什么' }], source: { kind: 'user' } },
+    ],
+  }
+  const out = await runPreStepWithDecision(ctx, session, base)
+  assert.equal(out.messages.length, 2, '应尾部追加一条注入消息')
+  const injected = out.messages[1]
+  assert.equal(injected.role, 'user')
+  assert.equal(injected.source.kind, 'plugin')
+  assert.equal(injected.source.plugin, 'dsh-lcm')
+  assert.equal(injected.source.form, 'snapshot')
+  assert.ok(injected.content[0].text.startsWith('<lcm-memory query="'))
+  assert.ok(injected.content[0].text.includes('记忆库根'))
+  assert.equal(out.messages[0], base.messages[0], '原消息数组不得被改动')
+
+  // meter 记账
+  const inj = readMeterEvents(lcmRoot, 'memory-inject')
+  assert.equal(inj.length, 1)
+  assert.equal(inj[0].mode, 'active')
+
+  // digest 节流：同样条目再跑一次 pre-step → 不重复注入
+  const out2 = await runPreStepWithDecision(ctx, session, { ...base, messages: [...base.messages] })
+  assert.equal(out2.messages.length, 1, '记忆未变化时不得重复注入')
+  assert.equal(readMeterEvents(lcmRoot, 'memory-inject').length, 1)
+})
+
+test('记忆注入臂 shadow：decision 原样返回，只记账', async () => {
+  const ctx = fakeCtx()
+  const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-meminj-s-'))
+  applyT(ctx, { mode: 'active', lcmRoot, memoryInjectMode: 'shadow' })
+  const { record } = await import('../../../core/memory.mjs')
+  record(lcfg(lcmRoot), { type: 'fact', subject: '注入纪律', claim: '注入块只能尾部追加，绝不插中间破坏前缀缓存' })
+  const session = fakeSession(lcmRoot, [])
+  const base = {
+    kind: 'run',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: '注入 纪律 尾部追加是什么规则' }], source: { kind: 'user' } },
+    ],
+  }
+  const out = await runPreStepWithDecision(ctx, session, base)
+  assert.equal(out.messages.length, 1, 'shadow 不得改写 messages')
+  assert.equal(readMeterEvents(lcmRoot, 'memory-inject')[0].mode, 'shadow')
+})
+
+test('记忆注入臂：无真实用户消息（全是插件注入）→ 不检索不注入', async () => {
+  const ctx = fakeCtx()
+  const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-meminj-nq-'))
+  applyT(ctx, { mode: 'active', lcmRoot, memoryInjectMode: 'active' })
+  const { record } = await import('../../../core/memory.mjs')
+  record(lcfg(lcmRoot), { type: 'fact', subject: 's', claim: '一条足以被检索到的记忆条目内容样例' })
+  const session = fakeSession(lcmRoot, [])
+  const base = {
+    kind: 'run',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'plugin snapshot' }], source: { kind: 'plugin', plugin: 'other' } }],
+  }
+  const out = await runPreStepWithDecision(ctx, session, base)
+  assert.equal(out.messages.length, 1)
+  assert.equal(readMeterEvents(lcmRoot, 'memory-inject').length, 0, '无查询不得记账')
 })

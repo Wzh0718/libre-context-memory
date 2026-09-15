@@ -53,9 +53,10 @@ Agent 每轮的 token 账单里，**真正新增的内容往往只占极小一�
 | 臂 | 钩子 | 治理对象 | 策略 |
 |---|---|---|---|
 | **① 压缩臂** | `tools/post-execute` | 单条超大工具输出 | 入库即压缩：>20k 字符 → 结构化摘要 + 可回取句柄（类型分流：log/json/jsonl/diff/table/filelist/code/generic） |
-| **② 剪枝臂** | `agent/pre-step` | 存量工具输出 | **搭便车驱动**：只在缓存本来就要失效时（`compaction/*` 事件后 / 观测到击穿后）才改写历史；`budgetTokens` 只做「值不值得剪」的守卫；保留 `pruneProactive` 开关给超长会话 |
+| **② 剪枝臂** | `agent/pre-step` | 存量工具输出 | **搭便车驱动**：只在缓存本来就要失效时（`compaction/*` 事件后 / 观测到击穿后 / subagent fork 首请求前）才改写历史；`budgetTokens` 只做「值不值得剪」的守卫；保留 `pruneProactive` 开关给超长会话 |
 | **③ 观测臂** | `session/event` | 每请求缓存账本 | 每轮记 fresh/cached/命中率/击穿苗头 + 折叠事件，落 meter |
 | **④ 静态层裁剪臂** | `system-prompt/assemble` | 工具定义注入 | **会话无关的确定性裁剪**（描述降噪 + 按族丢弃）；因工具定义在缓存前缀最前端，中途改动会击穿整个前缀，故只做「同输入必得逐字节同输出」的裁剪 |
+| **⑤ 记忆臂** | `session/event` + `agent/pre-step` | 对话知识（事实/决策/未决/结论） | 提取：搭 `compaction/summary` 便车，确定性提取入本地库（四选一写入决策 + 禁写过滤）；注入：按最近用户消息检索，**请求尾部追加**稳定块（digest 节流，前缀安全）；OpenViking 双写同步（outbox 兜底） |
 
 **为什么不只是压缩**：压缩解决「单条太肥」，剪枝解决「太多旧内容一直躺在热区」，静态层裁剪解决「每轮固定交税」，观测解决「看不见就治不了」。
 
@@ -263,11 +264,31 @@ pruneCooldownTokens: 10000    # 剪过一次后，会话需再长够此值才允
 pruneProactive: false         # true=回到主动预算触发（默认关）
 bustThresholdTokens: 50000    # fresh 超过此值视为「前缀已冷」
 pruneMinChars: 4000           # 候选下限：摘要本身 ~1k 字符，太小的剪了没收益
+# —— 记忆臂（Phase 3）——
+memoryExtract: true           # compaction/summary → 确定性提取入库（零 LLM 调用）
+memoryInjectMode: shadow      # active = 请求尾部追加检索块（digest 节流，前缀安全）
+memoryInjectMaxEntries: 6     # 注入块条目上限
 # —— 静态层裁剪臂 ——
 staticTrimMode: active        # 2026-09-15 人工复核 trim-diff 后切 active；复核件随时重看：lcm trim-diff
 toolMaxDescriptionChars: 300  # 0 = 关闭描述降噪
 dropToolFamilies: []          # 例：["mcp__openviking"] 整族不注入
 ```
+
+**记忆管理**（本地 `~/.lcm/memories` 永远是 source of truth；配置了 OpenViking 则双写同步，
+凭据自动复用 `~/.openviking/ovcli.conf`，不可达时落 outbox 下次冲账）：
+
+```bash
+node core/cli.mjs memory add --type decision --subject X --claim "..."   # 手动入库
+node core/cli.mjs memory list [--type fact] [--all]                     # 浏览（含被取代历史）
+node core/cli.mjs memory search --query "..."                           # 关键词检索
+node core/cli.mjs memory inject --query "..."                           # 预览注入块
+node core/cli.mjs memory sync                                           # 冲 OpenViking outbox
+node core/cli.mjs memory stats                                          # 库况/同步积压
+```
+
+写入不是 append 而是四选一决策（ADD/UPDATE/DELETE/NOOP，按 subject + claim 相似度分流）；
+secrets/瞬态/过短内容被硬过滤在库门外；条目幂等键 = 内容哈希（重试/双写/flush 不产生重复）。
+提取搭 DSH 内置 `compaction/summary` 的便车——LLM 摘要产物过确定性提取器，零额外调用。
 
 搭便车剪枝的三个免费窗口：① `compaction/*` 事件后（DSH 内置折叠已打穿前缀）；
 ② 观测到击穿后（fresh > bustThresholdTokens，前缀已冷）；③ **继承冷启动**——subagent
@@ -287,9 +308,9 @@ cd adapters/dsh && node --test test/*.test.js            # 适配器契约（伪
 
 | 套件 | 数量 | 结果 | 覆盖 |
 |---|---|---|---|
-| core 测试 | 15 | ✅ 15/15 | 压缩往返无损（含中文/emoji）、内容寻址去重、TTL 清理、容量上限最旧优先、清扫节流、计量轮转、**全局/项目根合并读取**、**旧口径 fresh 归一化 + 按项目过滤**、多帧 zstd 会话日志恢复、非法输入 |
+| core 测试 | 26 | ✅ 26/26 | 压缩往返无损（含中文/emoji）、内容寻址去重、TTL 清理、容量上限最旧优先、清扫节流、计量轮转、**全局/项目根合并读取**、**旧口径 fresh 归一化 + 按项目过滤**、**记忆写入决策四分支/禁写过滤/检索预算/注入确定性/提取幂等/outbox + mock HTTP 同步**、多帧 zstd 会话日志恢复、非法输入 |
 | **会话存活回放** | 5 | ✅ 5/5 | 用 DSH 自己的 `foldSurface` 回放含替换事件的日志：折叠接受、**surface 只剩替换节点**、原文仍在日志（可恢复）、折叠确定性、**反向校验生效**（越界改写被拒、缺 `sourceEventSeqs` 被拒） |
-| 适配器契约 | 23 | ✅ 23/23 | 直通/透传分支、shadow 不替换、active 替换+句柄可回取、失败静默、观测臂记账（project 标签）、剪枝预算/最小/最大优先/最新保护/冷却、piggyback 三窗口（compaction/击穿/**继承冷启动**）+ 守卫用例、静态层确定性 + **trim-diff 复核工件**、分臂模式、非法配置拒绝 |
+| 适配器契约 | 27 | ✅ 27/27 | 直通/透传分支、shadow 不替换、active 替换+句柄可回取、失败静默、观测臂记账（project 标签）、剪枝预算/最小/最大优先/最新保护/冷却、piggyback 三窗口（compaction/击穿/**继承冷启动**）+ 守卫用例、静态层确定性 + **trim-diff 复核工件**、**记忆提取臂（summary→入库幂等）/注入臂（尾部追加 + digest 节流 + shadow）**、分臂模式、非法配置拒绝 |
 | Phase 0 回放 | 144 样本 | ✅ 全达标 | 1428.3×，确定性 144/144 |
 
 **会话存活为什么是必测项**：剪枝会**改写会话历史**。若替换事件不满足 DSH 的校验规则（`surface.ts`：只能改 content、`shadowedSeqs` 恰好一个、`sourceEventSeqs` 必须覆盖被替换节点；`invariant.ts`：替换必须在打开的 turn 内追加），会话在重启/恢复时会加载失败。我们用 DSH 编译产物里的 `foldSurface` 直接回放验证，并且**包含反向用例**证明校验真的在跑。
@@ -304,7 +325,7 @@ cd adapters/dsh && node --test test/*.test.js            # 适配器契约（伪
 - **磁盘会增加而非减少**：原文落 spill（brotli 后约为原体积 1/26），靠 TTL + 容量上限控制
 - **默认搭便车剪枝**：`pruneProactive: false`，改写历史只在缓存本来就要失效时发生（`compaction/*` 后、观测到击穿后、subagent fork 首请求前），成本归零；主动路径仍保留给超长会话显式开启，但实测回本需要 ≥104 个后续请求
 - **计量数据曾按项目根分散**（会话 cwd + 服务器 cwd 两个落点，实测 85% 的事件落在 report 看不到的根）→ 已改为全局 `~/.lcm` 单根 + `project` 字段 + `lcm migrate` 一次性迁移；spill 原文仍按项目落盘
-- **记忆提取尚未实现**（Phase 3）：当前只有压缩/剪枝/观测，跨会话记忆与对话轮折叠是下一步（继承转写里剪不掉的 25% 对话体积是下一个量化目标）
+- **记忆注入默认 shadow**：检索质量（关键词打分 vs 语义检索）需 shadow 期数据复核后切 active；对话轮折叠（warm 层）尚未实现——继承转写里剪不掉的 25% 对话体积是下一个量化目标
 
 ---
 
@@ -327,7 +348,7 @@ cd adapters/dsh && node --test test/*.test.js            # 适配器契约（伪
 - ✅ **Phase 0**：数据采集与量化分析
 - ✅ **Phase 1**：压缩臂 + 剪枝臂 + 观测臂 + 静态层裁剪臂（DSH 已装、active 运行中）
 - ⏳ **Phase 2**：记分卡（成本当量 + 红线判定）与对照组实验
-- ⏳ **Phase 3**：记忆层（对话轮折叠 + 记忆提取 + 跨会话注入）——吃掉剩余 25% 的对话体积
+- 🔶 **Phase 3**：记忆臂已落地（提取入库 + 尾部注入 + OpenViking 双写，注入默认 shadow）；对话轮折叠（warm 层）待做——吃掉剩余 25% 的对话体积
 - ⏳ **Phase 4/5**：Claude Code / Codex 适配层
 
 ---
