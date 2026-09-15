@@ -335,3 +335,143 @@ test('A2 会话画像混合：占比上限/冷启动/确定性语义', async () 
   assert.ok(!prof.includes('会话乙主题'), '画像只含本会话条目')
   assert.equal(mem.sessionProfileOf(cfg, 's-unknown'), '')
 })
+
+test('B4 重现证据：同一条目再次提出 → seenCount/seenSessions 记录', async () => {
+  const mem = await import('../memory.mjs')
+  const r = mkdtempSync(join(tmpdir(), 'lcm-seen-'))
+  const cfg = loadConfig(r, { meterRoot: join(r, '.lcm') })
+  mkdirSync(cfg.memoryDir, { recursive: true })
+  const cand = {
+    type: 'decision', subject: '落盘策略', claim: '决定记忆库以 ~/.lcm 为唯一真相源，远端只做异步双写备份',
+    source: 'manual',
+  }
+  const a = mem.record(cfg, { ...cand, sessionId: 's1' })
+  assert.equal(a.action, 'ADD')
+  const b = mem.record(cfg, { ...cand, sessionId: 's2' })
+  assert.equal(b.action, 'NOOP')
+  assert.equal(b.seen, 2, '重现次数必须被记录')
+  const e = mem.loadAll(cfg).find((x) => x.id === a.id)
+  assert.deepEqual(e.seenSessions.sort(), ['s1', 's2'], '跨会话来源必须去重记录')
+})
+
+test('B4 自动晋升/降级：跨会话复现 + 质量达标；pin 条目免疫自动降级', async () => {
+  const mem = await import('../memory.mjs')
+  const r = mkdtempSync(join(tmpdir(), 'lcm-promo-'))
+  const cfg = loadConfig(r, { meterRoot: join(r, '.lcm') })
+  mkdirSync(cfg.memoryDir, { recursive: true })
+  // 达标：preference 类型 + 2 个会话 + 高分
+  const good = mem.record(cfg, {
+    type: 'preference', subject: '输出偏好', claim: '用户偏好：结论先行，附带可复核的数据与命令，不用空话',
+    score: 0.9, source: 'manual', sessionId: 's1',
+  })
+  mem.record(cfg, {
+    type: 'preference', subject: '输出偏好', claim: '用户偏好：结论先行，附带可复核的数据与命令，不用空话',
+    score: 0.9, source: 'manual', sessionId: 's2',
+  })
+  // 不达标：只在一个会话出现
+  const solo = mem.record(cfg, {
+    type: 'preference', subject: '临时偏好', claim: '用户在这一次会话里提到想要更长的解释，但没有复现',
+    score: 0.9, source: 'manual', sessionId: 's3',
+  })
+  // 不达标：质量分低
+  const lowQ = mem.record(cfg, {
+    type: 'decision', subject: '低分决策', claim: '某个跨会话复现但质量分偏低的决策内容，用于验证门控',
+    score: 0.5, source: 'manual', sessionId: 's4',
+  })
+  mem.record(cfg, {
+    type: 'decision', subject: '低分决策', claim: '某个跨会话复现但质量分偏低的决策内容，用于验证门控',
+    score: 0.5, source: 'manual', sessionId: 's5',
+  })
+  const res = mem.autoProfile(cfg)
+  assert.ok(res.promoted >= 1)
+  const profIds = mem.profileEntries(cfg).map((e) => e.id)
+  assert.ok(profIds.includes(good.id), '跨会话+高质量必须晋升')
+  assert.ok(!profIds.includes(solo.id), '单会话不得晋升')
+  assert.ok(!profIds.includes(lowQ.id), '质量不达标不得晋升')
+
+  // 再来一个自动晋升且不 pin 的条目，用于对照降级
+  const other = mem.record(cfg, {
+    type: 'preference', subject: '另一个偏好', claim: '用户偏好：批量改动要一次性给出可核对的清单而不是零散说明',
+    score: 0.9, source: 'manual', sessionId: 's6',
+  })
+  mem.record(cfg, {
+    type: 'preference', subject: '另一个偏好', claim: '用户偏好：批量改动要一次性给出可核对的清单而不是零散说明',
+    score: 0.9, source: 'manual', sessionId: 's7',
+  })
+  mem.autoProfile(cfg)
+  assert.ok(mem.profileEntries(cfg).some((e) => e.id === other.id), '对照条目应先被自动晋升')
+
+  // 30 天未再出现 → 自动晋升条目降级；pin 条目免疫
+  mem.setProfile(cfg, good.id, true)   // good 转为手动 pin
+  const later = Date.now() + 31 * 86_400_000
+  const res2 = mem.autoProfile(cfg, { now: later })
+  assert.ok(res2.demoted >= 1, '久未出现的自动画像条目应被降级')
+  const profIds2 = mem.profileEntries(cfg).map((e) => e.id)
+  assert.ok(profIds2.includes(good.id), 'pin 的条目不得被自动降级')
+  assert.ok(!profIds2.includes(other.id), '自动晋升且久未出现 → 应被降级')
+})
+
+test('B4 画像预算：条目数与字符数双封顶，pin 优先保留', async () => {
+  const mem = await import('../memory.mjs')
+  const r = mkdtempSync(join(tmpdir(), 'lcm-budget-'))
+  const cfg = loadConfig(r, { meterRoot: join(r, '.lcm') })
+  mkdirSync(cfg.memoryDir, { recursive: true })
+  const ids = []
+  for (let i = 0; i < 30; i++) {
+    const rec = mem.record(cfg, {
+      type: 'preference', subject: `偏好主题${i}`,
+      claim: `用户偏好第 ${i} 条：内容足够长以便占用预算，验证双封顶行为是否生效`,
+      score: 0.9, source: 'manual', sessionId: 's1',
+    })
+    ids.push(rec.id)
+    mem.setProfile(cfg, rec.id, true)
+  }
+  const auto = mem.autoProfile(cfg)
+  const prof = mem.profileEntries(cfg)
+  assert.ok(prof.length <= mem.PROFILE_MAX_ENTRIES, `条目数必须 ≤${mem.PROFILE_MAX_ENTRIES}（实际 ${prof.length}）`)
+  const chars = prof.reduce((n, e) => n + e.subject.length + e.claim.length + 4, 0)
+  assert.ok(chars <= mem.PROFILE_MAX_CHARS, `字符数必须 ≤${mem.PROFILE_MAX_CHARS}（实际 ${chars}）`)
+  assert.ok(auto.trimmed > 0 || auto.kept > 0)
+})
+
+test('A3 读时加成：画像条目 ×1.2 提升排序，未晋升条目不受影响', async () => {
+  const mem = await import('../memory.mjs')
+  const r = mkdtempSync(join(tmpdir(), 'lcm-boost-'))
+  const cfg = loadConfig(r, { meterRoot: join(r, '.lcm') })
+  mkdirSync(cfg.memoryDir, { recursive: true })
+  const a = mem.record(cfg, { type: 'fact', subject: '读分加成', claim: '画像条目的读分加成是 1.2 倍系数，用于提升排序', score: 0.7, source: 'manual' })
+  mem.record(cfg, { type: 'fact', subject: '读分加成', claim: '第二个同样相关的条目用于对比加成效果是否生效', score: 0.7, source: 'manual' })
+  const before = mem.search(cfg, '读分加成', { k: 5 }).map((e) => e.id)
+  assert.equal(before[0], a.id)
+  mem.setProfile(cfg, a.id, true)
+  const boost = mem.profileBoostOf(cfg)
+  assert.ok(typeof boost === 'function')
+  assert.equal(boost({ id: a.id }), mem.PROFILE_READ_BOOST)
+  assert.equal(boost({ id: 'other' }), 1)
+  const after = mem.search(cfg, '读分加成', { k: 5, qualityBoostOf: boost }).map((e) => e.id)
+  assert.equal(after[0], a.id, '晋升后仍应保持首位（加成不得反向）')
+  // 无常驻画像时返回 null（避免无谓的每查询 Set 构建）
+  const empty = mkdtempSync(join(tmpdir(), 'lcm-boost0-'))
+  const cfg2 = loadConfig(empty, { meterRoot: join(empty, '.lcm') })
+  mkdirSync(cfg2.memoryDir, { recursive: true })
+  assert.equal(mem.profileBoostOf(cfg2), null)
+})
+
+test('A3 画像常驻注入段：预算内渲染 + 查询相关优先 + 确定性', async () => {
+  const mem = await import('../memory.mjs')
+  const r = mkdtempSync(join(tmpdir(), 'lcm-plines-'))
+  const cfg = loadConfig(r, { meterRoot: join(r, '.lcm') })
+  mkdirSync(cfg.memoryDir, { recursive: true })
+  assert.deepEqual(mem.profileInjectLines(cfg, '任意查询'), [], '无画像条目 → 空段（不注入）')
+  const p1 = mem.record(cfg, { type: 'preference', subject: '提交习惯', claim: '用户偏好：改动先跑全量测试再提交，提交信息用中文正文', score: 0.9, source: 'manual' })
+  const p2 = mem.record(cfg, { type: 'preference', subject: '输出习惯', claim: '用户偏好：回答用表格与数据说话，避免空泛描述', score: 0.9, source: 'manual' })
+  mem.setProfile(cfg, p1.id, true)
+  mem.setProfile(cfg, p2.id, true)
+  const lines = mem.profileInjectLines(cfg, '这次提交要注意什么')
+  assert.equal(lines.length, 2)
+  assert.ok(lines[0].includes('提交习惯'), '与查询相关的画像条目排前')
+  const again = mem.profileInjectLines(cfg, '这次提交要注意什么')
+  assert.deepEqual(lines, again, '同输入必须同输出（注入块逐字节稳定）')
+  const capped = mem.profileInjectLines(cfg, '提交', { maxChars: 40 })
+  assert.ok(capped.length < 2, '字符预算必须生效')
+})

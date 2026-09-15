@@ -390,6 +390,27 @@ async function main() {
       console.error(`[lcm] ${rows.length} 条${args.all ? '（含历史）' : ''}`)
       return 0
     }
+    if (sub === 'pin' || sub === 'unpin') {
+      if (!args.id) { console.error(`用法: lcm memory ${sub} --id <条目 id>`); return 2 }
+      const r = mem.setProfile(cfg, args.id, sub === 'pin')
+      if (!r.ok) { console.error(`[lcm] 未找到条目 ${args.id}`); return 1 }
+      console.log(`[lcm] ${sub === 'pin' ? '已晋升为画像条目' : '已从画像移除'}：${r.entry.subject || r.entry.claim.slice(0, 40)}`)
+      return 0
+    }
+    if (sub === 'profile') {
+      if (args.auto) {
+        const r = mem.autoProfile(cfg)
+        console.log(`[lcm] 自动晋升 ${r.promoted}｜自动降级 ${r.demoted}｜预算裁剪 ${r.trimmed}｜画像保留 ${r.kept}/${mem.PROFILE_MAX_ENTRIES}`)
+      }
+      const prof = mem.profileEntries(cfg)
+      const chars = prof.reduce((n, e) => n + (e.subject?.length ?? 0) + (e.claim?.length ?? 0) + 4, 0)
+      console.log(`画像条目 ${prof.length}/${mem.PROFILE_MAX_ENTRIES}（${chars}/${mem.PROFILE_MAX_CHARS} chars）`)
+      for (const e of prof) {
+        const src = e.promotedBy === 'pin' ? '📌' : '自动'
+        console.log(`  ${src} [${e.type}] ${e.claim.startsWith(String(e.subject).slice(0, 20)) || !e.subject ? e.claim : e.subject + '：' + e.claim}  (${e.id})`)
+      }
+      return 0
+    }
     if (sub === 'eval') {
       const ev = await import('./eval.mjs')
       const golden = ev.loadGolden(cfg, { rebuild: Boolean(args.rebuild) })

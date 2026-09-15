@@ -624,9 +624,18 @@ export function apply(ctx, config = {}) {
           }
         } catch { /* 混合失败退回纯用户消息 */ }
       }
-      const entries = query ? memory.search(meterBase, query, { k: cfg.memoryInjectMaxEntries }) : []
+      // 画像加成（A3）：晋升条目读时 ×1.2（pin 或跨会话复现达标的条目）
+      let boostOf = null
+      try { boostOf = memory.profileBoostOf(meterBase) } catch { /* 画像缺失静默 */ }
+      const entries = query ? memory.search(meterBase, query, { k: cfg.memoryInjectMaxEntries, qualityBoostOf: boostOf }) : []
       const block = entries.length > 0 ? memory.renderInjectBlock(query, entries) : null
-      const text = [profileBlock, block].filter(Boolean).join('\n')
+      // 用户画像条目常驻段（预算 ≤800 chars，pin 与自动晋升都在内）
+      let profileMemBlock = null
+      try {
+        const lines = memory.profileInjectLines(meterBase, query, { maxEntries: cfg.memoryProfileInjectMaxEntries })
+        if (lines.length > 0) profileMemBlock = ['<lcm-profile-memory>', ...lines, '</lcm-profile-memory>'].join('\n')
+      } catch { /* 静默 */ }
+      const text = [profileBlock, profileMemBlock, block].filter(Boolean).join('\n')
       if (!text) return decision
       const digest = createHash('sha256').update(text).digest('hex').slice(0, 12)
       if (lastInjectDigest.get(sessionKey2) === digest) return decision   // 内容没变，不重复注入

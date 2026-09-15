@@ -264,6 +264,13 @@ pruneCooldownTokens: 10000    # 剪过一次后，会话需再长够此值才允
 pruneProactive: false         # true=回到主动预算触发（默认关）
 bustThresholdTokens: 50000    # fresh 超过此值视为「前缀已冷」
 pruneMinChars: 4000           # 候选下限：摘要本身 ~1k 字符，太小的剪了没收益
+# —— 用户画像条目（A3/B4：晋升/pin/加成/常驻注入）——
+# node core/cli.mjs memory pin --id <条目id>      # 手动晋升（免疫自动降级）
+# node core/cli.mjs memory unpin --id <条目id>
+# node core/cli.mjs memory profile [--auto]        # 查看/自动晋升+降级
+#   晋升门槛：跨会话复现(≥2 会话) + 质量≥0.8 + 类型∈{preference,decision,conclusion}
+#   预算：≤20 条 / ≤800 chars；30 天未再出现 → 自动降级（pin 免疫）
+#   读时加成 ×1.2；常驻注入段 <lcm-profile-memory>
 # —— 金标评测（shadow→active 的放行依据）——
 # node core/cli.mjs memory eval [--rebuild] [--k 6] [--json]
 #   主指标：跨会话 recall@6（真实用户消息 → 召回他处学到的旧记忆）≥0.8
@@ -294,6 +301,8 @@ node core/cli.mjs memory stats                                          # 库况
 ```
 
 画像：`lcm profile [--refresh|--json]`——习惯画像（只扫 user talk：意图/开场/确认率/句式指纹/推进链；过滤 DSH checkpoint 伪装消息 + 续接重放去重）+ 行为画像（meter 统计：活跃节奏/注意力/会话深度）→ `<lcm-profile>` 常驻块（预算内截断，模型第一轮就知道怎么协作——省对齐轮次）。
+用户画像：跨会话复现（≥2 会话）且质量≥0.8 的 preference/decision/conclusion 自动晋升为画像条目（或手动 `memory pin`）——读时 ×1.2 加成 + 常驻注入段 `<lcm-profile-memory>`，预算 ≤20 条/800 字符，30 天未复现自动降级（pin 免疫）。受控实验：晋升准确时 MRR 0.783→0.802，晋升干扰项时仅轻微劣化（recall -1.7pt）——机制温和可控。
+
 评测：`lcm memory eval`——金标集自动构造（跨会话/同会话/自查询正例 + 死条目/噪声反例），主指标跨会话 recall@6（实测本机 96.7%，61 对；反例击穿 0）；评测不达标则两个 shadow 臂不得切 active。
 写入不是 append 而是四选一决策（ADD/UPDATE/DELETE/NOOP，按 subject + claim 相似度分流；低分候选按来源分层拒之门外：manual 不限 / summary 0.45 / 原始轮 0.6）；
 secrets/瞬态/过短内容被硬过滤在库门外；条目幂等键 = 内容哈希（重试/双写/flush 不产生重复）。
@@ -317,7 +326,7 @@ cd adapters/dsh && node --test test/*.test.js            # 适配器契约（伪
 
 | 套件 | 数量 | 结果 | 覆盖 |
 |---|---|---|---|
-| core 测试 | 46 | ✅ 46/46 | 压缩往返无损（含中文/emoji）、内容寻址去重、TTL 清理、容量上限最旧优先、清扫节流、计量轮转、**全局/项目根合并读取**、**旧口径 fresh 归一化 + 按项目过滤**、**记忆写入决策四分支/禁写过滤/质量门槛分层/检索预算/注入确定性/提取幂等（表格行/引用前缀/冗余 subject 归零）/outbox + mock HTTP 同步**、**画像：harness 伪装消息过滤/续接重放去重/意图分类/句式指纹/预算截断保闭合/热路径只读缓存**、多帧 zstd 会话日志恢复、非法输入 |
+| core 测试 | 53 | ✅ 53/53 | 压缩往返无损（含中文/emoji）、内容寻址去重、TTL 清理、容量上限最旧优先、清扫节流、计量轮转、**全局/项目根合并读取**、**旧口径 fresh 归一化 + 按项目过滤**、**记忆写入决策四分支/禁写过滤/质量门槛分层/检索预算/注入确定性/提取幂等（表格行/引用前缀/冗余 subject 归零）/outbox + mock HTTP 同步**、**画像：harness 伪装消息过滤/续接重放去重/意图分类/句式指纹/预算截断保闭合/热路径只读缓存**、多帧 zstd 会话日志恢复、非法输入 |
 | **会话存活回放** | 5 | ✅ 5/5 | 用 DSH 自己的 `foldSurface` 回放含替换事件的日志：折叠接受、**surface 只剩替换节点**、原文仍在日志（可恢复）、折叠确定性、**反向校验生效**（越界改写被拒、缺 `sourceEventSeqs` 被拒） |
 | 适配器契约 | 35 | ✅ 35/35 | 直通/透传分支、shadow 不替换、active 替换+句柄可回取、失败静默、观测臂记账（project 标签）、剪枝预算/最小/最大优先/最新保护/冷却、piggyback 三窗口（compaction/击穿/**继承冷启动**）+ 守卫用例、静态层确定性 + **trim-diff 复核工件**、**金标评测（跨会话配对不变量/项目键归一/死条目与噪声反例/放行 gate）+ warm folding 折叠臂（只折水位线以下=已蒸馏轮次/最新 4 轮与短消息与插件消息不折/指针行不伪装真人消息/无水位线安全默认/无可折不记账）+ 增量熔炼臂（水位线只扫新增 seq/插件注入+harness 模板过滤/每步 24 候选上限/水位线持久化重启不重扫）+ 记忆提取臂（summary→入库幂等 + 质量门槛行为锁定）/注入臂（尾部追加 + digest 节流 + shadow）/画像常驻注入（无查询也注入 + 同会话节流）**、分臂模式、非法配置拒绝 |
 | Phase 0 回放 | 144 样本 | ✅ 全达标 | 1428.3×，确定性 144/144 |

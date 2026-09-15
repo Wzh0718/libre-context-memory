@@ -141,9 +141,18 @@ export function record(cfg, cand, { now = Date.now() } = {}) {
   }
   const id = entryId(c.type, c.subject, c.claim)
   const all = loadAll(cfg)
-  if (all.some((e) => e.id === id)) {
-    meter.record(cfg, { kind: 'memory', action: 'NOOP', id, type: c.type, subject: c.subject })
-    return { action: 'NOOP', id, reason: 'id-exists' }
+  const dup = all.find((e) => e.id === id)
+  if (dup) {
+    // 重现证据：同一知识再次被提出 → 记会话来源与次数（晋升判据：≥2 独立会话）
+    dup.seenCount = (dup.seenCount ?? 1) + 1
+    dup.lastSeenAt = now
+    if (c.sessionId) {
+      const seen = new Set([...(dup.seenSessions ?? []), ...(dup.sessionId ? [dup.sessionId] : []), c.sessionId])
+      dup.seenSessions = [...seen].slice(-5)
+    }
+    persist(cfg, all)
+    meter.record(cfg, { kind: 'memory', action: 'NOOP', id, type: c.type, subject: c.subject, seen: dup.seenCount })
+    return { action: 'NOOP', id, reason: 'id-exists', seen: dup.seenCount }
   }
   // 同 subject 的有效旧条目 → 按 claim 相似度分流
   const live = activeEntriesFrom(all)
@@ -247,6 +256,126 @@ export function readScore(e, q, { now = Date.now(), qualityBoost = 1, mode = DEF
   }
 }
 
+// ---------------------------------------------------------------- 画像条目（A3/B4）
+// 用户画像 = 记忆库里被「晋升」的条目：跨会话复现（≥2 独立会话）且质量达标，
+// 或用户手动 pin。用途：① 常驻注入 ② 读时加成 ③ 名额与字符预算封顶。
+
+/** 画像预算：条目数与字符数双封顶（常驻注入不能成为体积源）。 */
+export const PROFILE_MAX_ENTRIES = 20
+export const PROFILE_MAX_CHARS = 800
+export const PROFILE_PROMOTE_MIN_SESSIONS = 2
+export const PROFILE_PROMOTE_MIN_QUALITY = 0.8
+export const PROFILE_DEMOTE_DAYS = 30
+export const PROFILE_READ_BOOST = 1.2
+
+/** 画像条目（活跃）：profile=true 且未被取代。 */
+export function profileEntries(cfg, { now = Date.now() } = {}) {
+  return activeEntries(cfg)
+    .filter((e) => e.profile === true)
+    .sort((a, b) => (b.score ?? 0) - (a.score ?? 0) || (b.ts ?? 0) - (a.ts ?? 0))
+}
+
+/** 手动晋升/降级（pin 的条目不会被自动降级）。 */
+export function setProfile(cfg, id, on, { by = 'pin', now = Date.now() } = {}) {
+  const all = loadAll(cfg)
+  const e = all.find((x) => x.id === id)
+  if (!e) return { ok: false, reason: 'not-found' }
+  if (on) { e.profile = true; e.promotedAt = now; e.promotedBy = by } else {
+    delete e.profile; delete e.promotedAt; delete e.promotedBy
+  }
+  persist(cfg, all)
+  meter.record(cfg, { kind: 'memory', action: on ? 'PROMOTE' : 'DEMOTE', id, by, type: e.type, subject: e.subject })
+  return { ok: true, entry: e }
+}
+
+/**
+ * 自动晋升 + 自动降级（幂等，按需调用）。
+ * 晋升：跨会话复现（seenSessions ≥2）+ 质量 ≥0.8 + 类型属于画像候选（preference/decision/conclusion）
+ * 降级：仅自动晋升的条目，且 30 天未再出现（手动 pin 永久保留）
+ * 预算：晋升后超限 → 按（pin 优先保留，其次分数/新鲜度）裁到上限
+ */
+export function autoProfile(cfg, { now = Date.now() } = {}) {
+  const all = loadAll(cfg)
+  const live = activeEntriesFrom(all)
+  let promoted = 0, demoted = 0
+  const PROFILE_TYPES = new Set(['preference', 'decision', 'conclusion'])
+  for (const e of live) {
+    const sessions = new Set([...(e.seenSessions ?? []), ...(e.sessionId ? [e.sessionId] : [])])
+    const eligible = PROFILE_TYPES.has(e.type)
+      && sessions.size >= PROFILE_PROMOTE_MIN_SESSIONS
+      && (e.score ?? 0) >= PROFILE_PROMOTE_MIN_QUALITY
+    if (e.profile !== true && eligible) {
+      e.profile = true; e.promotedAt = now; e.promotedBy = 'auto'; promoted++
+    }
+  }
+  for (const e of live) {
+    if (e.profile !== true || e.promotedBy !== 'auto') continue
+    const lastSeen = Math.max(e.lastSeenAt ?? 0, e.ts ?? 0)
+    if (now - lastSeen > PROFILE_DEMOTE_DAYS * 86_400_000) {
+      delete e.profile; delete e.promotedAt; delete e.promotedBy; demoted++
+    }
+  }
+  // 预算裁剪：pin 永久保留；auto 条目按分数×新鲜度裁掉弱者
+  const prof = live.filter((e) => e.profile === true)
+    .sort((a, b) => (b.promotedBy === 'pin' ? 1 : 0) - (a.promotedBy === 'pin' ? 1 : 0)
+      || (b.score ?? 0) - (a.score ?? 0) || (b.ts ?? 0) - (a.ts ?? 0))
+  const keep = new Set()
+  let chars = 0
+  for (const e of prof) {
+    const cost = (e.subject?.length ?? 0) + (e.claim?.length ?? 0) + 4
+    if (keep.size >= PROFILE_MAX_ENTRIES || chars + cost > PROFILE_MAX_CHARS) continue
+    keep.add(e.id); chars += cost
+  }
+  let trimmed = 0
+  for (const e of prof) {
+    if (!keep.has(e.id)) { delete e.profile; delete e.promotedAt; delete e.promotedBy; trimmed++ }
+  }
+  if (promoted || demoted || trimmed) persist(cfg, all)
+  if (promoted || demoted || trimmed) {
+    meter.record(cfg, { kind: 'memory-profile', action: 'auto', promoted, demoted, trimmed, kept: keep.size })
+  }
+  return { promoted, demoted, trimmed, kept: keep.size }
+}
+
+/**
+ * 读时加成因子：画像条目 ×1.2（接 search 的 qualityBoostOf）。
+ *
+ * 受控实验（金标 61 对跨会话，2026-09-15）：
+ * - 晋升「正确」条目（= 金标期望条目）38 条：MRR 0.783→0.802，top1 65.6%→67.2%，recall 持平
+ * - 晋升「干扰项」（= 无关高分条目）38 条：MRR 0.783→0.772，recall 98.4%→96.7%
+ * 结论：加成方向正确但价值取决于晋升精度（故有 ≥2 会话 + 质量 0.8 + 预算 20 条的门槛）；
+ * ×1.2 足够温和——画像不准确时只轻微劣化，不会毁掉检索。
+ */
+export function profileBoostOf(cfg) {
+  const ids = new Set(profileEntries(cfg).map((e) => e.id))
+  if (ids.size === 0) return null
+  return (e) => (ids.has(e.id) ? PROFILE_READ_BOOST : 1)
+}
+
+/** 命中查询的画像条目（常驻注入用）：按 query 打分取前 N，受字符预算约束。 */
+export function profileInjectLines(cfg, query, { maxEntries = 8, maxChars = PROFILE_MAX_CHARS } = {}) {
+  const prof = profileEntries(cfg)
+  if (prof.length === 0) return []
+  const q = query ? tokensOf(query) : new Set()
+  const ranked = prof
+    .map((e) => ({ e, rel: q.size ? relevanceOf(e, q) : 0 }))
+    .sort((a, b) => b.rel - a.rel || (b.e.score ?? 0) - (a.e.score ?? 0) || (b.e.ts ?? 0) - (a.e.ts ?? 0))
+  const out = []
+  let chars = 0
+  for (const { e } of ranked.slice(0, maxEntries)) {
+    const line = renderEntryLine(e)
+    if (chars + line.length > maxChars) break
+    out.push(line); chars += line.length
+  }
+  return out
+}
+
+/** 单条条目的一行渲染（画像块/注入块共用，确定性）。 */
+export function renderEntryLine(e) {
+  const date = new Date(e.ts ?? 0).toISOString().slice(0, 10)
+  return `- [${e.type}] ${displayOf(e)}（${date}，id:${e.id}）`
+}
+
 /** 会话画像文本：本会话已入库条目的主题/内容摘要（注入查询的混合源）。 */
 export function sessionProfileOf(cfg, sessionId, { maxChars = 300, maxEntries = 8 } = {}) {
   if (!sessionId) return ''
@@ -330,10 +459,7 @@ function displayOf(e) {
 export function renderInjectBlock(query, entries) {
   if (entries.length === 0) return null
   const lines = [`<lcm-memory query="${String(query).slice(0, 80).replace(/"/g, '\'')}">`]
-  for (const e of entries) {
-    const date = new Date(e.ts ?? 0).toISOString().slice(0, 10)
-    lines.push(`- [${e.type}] ${displayOf(e)}（${date}，id:${e.id}）`)
-  }
+  for (const e of entries) lines.push(renderEntryLine(e))
   lines.push('</lcm-memory>')
   return lines.join('\n')
 }
