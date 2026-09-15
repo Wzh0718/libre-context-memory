@@ -38,7 +38,7 @@ function parseArgs(argv) {
     const a = argv[i]
     if (a.startsWith('--')) {
       const key = a.slice(2)
-      if (['json', 'no-spill', 'dry-run', 'rebuild', 'all', 'refresh', 'source'].includes(key) && key !== 'source') args[key] = true
+      if (['json', 'no-spill', 'dry-run', 'rebuild', 'all', 'refresh', 'blend'].includes(key)) args[key] = true
       else args[key] = argv[++i]
     } else args._.push(a)
   }
@@ -393,7 +393,7 @@ async function main() {
     if (sub === 'eval') {
       const ev = await import('./eval.mjs')
       const golden = ev.loadGolden(cfg, { rebuild: Boolean(args.rebuild) })
-      const r = ev.runEval(cfg, golden, { k: Number(args.k ?? ev.EVAL_K), mode: args.mode ?? undefined })
+      const r = ev.runEval(cfg, golden, { k: Number(args.k ?? ev.EVAL_K), mode: args.mode ?? undefined, blend: Boolean(args.blend) })
       if (args.json) { console.log(JSON.stringify(r, null, 2)); return r.ok ? 0 : 1 }
       console.log(ev.renderEvalReport(r, golden))
       return r.ok ? 0 : 1

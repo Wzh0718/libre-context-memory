@@ -247,6 +247,50 @@ export function readScore(e, q, { now = Date.now(), qualityBoost = 1, mode = DEF
   }
 }
 
+/** 会话画像文本：本会话已入库条目的主题/内容摘要（注入查询的混合源）。 */
+export function sessionProfileOf(cfg, sessionId, { maxChars = 300, maxEntries = 8 } = {}) {
+  if (!sessionId) return ''
+  const mine = activeEntries(cfg).filter((e) => e.sessionId === sessionId)
+  if (mine.length === 0) return ''
+  mine.sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))          // 最近的优先
+  const parts = []
+  let used = 0
+  for (const e of mine.slice(0, maxEntries)) {
+    const t = e.subject ? `${e.subject} ${e.claim}` : e.claim
+    if (used + t.length > maxChars) break
+    parts.push(t)
+    used += t.length
+  }
+  return parts.join(' ')
+}
+
+/** 画像占比：随会话条目数增长，上限 maxShare（用户拍板 70%）。 */
+export function profileShareOf(entryCount, { maxShare = 0.7 } = {}) {
+  if (entryCount <= 0) return 0
+  return Math.min(maxShare, 0.2 + 0.1 * (entryCount - 1))
+}
+
+/**
+ * 混合查询：用户消息 ⊕ 会话画像。占比靠**字符质量比**控制（画像长度按
+ * share/(1-share) 缩放），保持确定性、可测；无画像时退回纯用户消息（冷启动）。
+ *
+ * ⚠ A/B 实测（金标 74 对跨/同会话，2026-09-15）：混合**不提升且略降排序**
+ * （MRR 0.799→0.765，top1 67.6%→62.2%，recall 持平）。设计初衷（短追问如
+ * 「继续」缺主题词）在金标里无法覆盖——配对本身要求 ≥2 token 重叠，短消息
+ * 配不上对。结论：默认不启用（memoryQueryBlend: false），仅供真实会话出现
+ * 短追问场景时手工开启验证。
+ */
+export function blendQuery(userQuery, profileText, { share = 0, maxShare = 0.7 } = {}) {
+  const u = String(userQuery ?? '').trim()
+  const p = String(profileText ?? '').trim()
+  const sh = Math.min(maxShare, Math.max(0, share))
+  if (!u || !p || sh <= 0) return u
+  const profileChars = Math.round((sh / (1 - sh)) * [...u].length)
+  if (profileChars <= 0) return u
+  const cut = [...p].slice(0, profileChars).join('')
+  return `${u} ${cut}`
+}
+
 export function search(cfg, query, { k = 6, maxChars = 2_500, qualityBoostOf = null, mode = DEFAULT_SCORE_MODE } = {}) {
   const q = tokensOf(query)
   if (q.size === 0) return []

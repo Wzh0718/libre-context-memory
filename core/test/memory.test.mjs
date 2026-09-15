@@ -312,3 +312,26 @@ test('search：模式可选 + 结果确定性（同查询两次逐条相同）',
   const legacy = mem.search(cfg, '读分模式 选择', { k: 5, mode: 'legacy' })
   assert.equal(legacy.length, a.length)
 })
+
+test('A2 会话画像混合：占比上限/冷启动/确定性语义', async () => {
+  const mem = await import('../memory.mjs')
+  const r = mkdtempSync(join(tmpdir(), 'lcm-blend-'))
+  const cfg = loadConfig(r, { meterRoot: join(r, '.lcm') })
+  mkdirSync(cfg.memoryDir, { recursive: true })
+  assert.equal(mem.profileShareOf(0), 0, '无条目 → 零占比（冷启动只用用户消息）')
+  assert.equal(mem.profileShareOf(1), 0.2)
+  assert.equal(mem.profileShareOf(100), 0.7, '占比上限 70%（用户拍板）')
+  assert.equal(mem.blendQuery('继续', ''), '继续', '无画像 → 纯用户消息')
+  assert.equal(mem.blendQuery('继续', '画' * 999, { share: 0 }), '继续', '占比 0 → 纯用户消息')
+  // 占比决定画像字符质量：share=0.5 时画像 ≈ 用户消息长度
+  const blended = mem.blendQuery('用户消息内容', '画像内容啊啊啊', { share: 0.5 })
+  assert.ok(blended.startsWith('用户消息内容'))
+  assert.ok(blended.length > '用户消息内容'.length)
+  // 会话画像：只取本会话条目、最近优先、有界
+  mem.record(cfg, { type: 'fact', subject: '会话甲主题', claim: '甲会话里定下来的完整结论内容足够长', source: 'manual', sessionId: 's1' })
+  mem.record(cfg, { type: 'fact', subject: '会话乙主题', claim: '乙会话里定下来的完整结论内容足够长', source: 'manual', sessionId: 's2' })
+  const prof = mem.sessionProfileOf(cfg, 's1')
+  assert.ok(prof.includes('会话甲主题'))
+  assert.ok(!prof.includes('会话乙主题'), '画像只含本会话条目')
+  assert.equal(mem.sessionProfileOf(cfg, 's-unknown'), '')
+})

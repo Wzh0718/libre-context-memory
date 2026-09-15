@@ -612,7 +612,18 @@ export function apply(ctx, config = {}) {
         const prof = profile.getProfile(meterBase, { allowScan: false })
         profileBlock = profile.renderProfileBlock(meterBase, prof ?? {})
       } catch { /* 画像缺失静默 */ }
-      const query = lastUserQuery(decision.messages)
+      let query = lastUserQuery(decision.messages)
+      if (query && cfg.memoryQueryBlend) {
+        // 混合会话画像（默认关；A/B 实测略降排序，见 memory.blendQuery 注释）
+        try {
+          const prof = memory.sessionProfileOf(meterBase, sessionKey2)
+          if (prof) {
+            const mine = memory.sessionProfileOf(meterBase, sessionKey2, { maxChars: 1 })  // 触发一次计数即可
+            void mine
+            query = memory.blendQuery(query, prof, { share: 0.2 })
+          }
+        } catch { /* 混合失败退回纯用户消息 */ }
+      }
       const entries = query ? memory.search(meterBase, query, { k: cfg.memoryInjectMaxEntries }) : []
       const block = entries.length > 0 ? memory.renderInjectBlock(query, entries) : null
       const text = [profileBlock, block].filter(Boolean).join('\n')

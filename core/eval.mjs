@@ -195,8 +195,21 @@ export function buildGolden(cfg, { sessionsDir, maxPerSession = 6, logLimit = 20
 }
 
 /** 跑评测。返回 {recall, hits, total, penetration, misses, penetrationDetails, byKind, ok}。 */
-export function runEval(cfg, golden, { k = EVAL_K, mode = memory.DEFAULT_SCORE_MODE } = {}) {
+export function runEval(cfg, golden, { k = EVAL_K, mode = memory.DEFAULT_SCORE_MODE, blend = false } = {}) {
   const results = new Map()   // query → id 列表
+  // 会话画像混合（A2）：画像取自**查询所属会话**自己的条目——生产同款行为。
+  // 注意循环风险：期望条目可能就在画像里（等于把答案塞进查询），故必须 A/B 实测
+  const profileCache = new Map()
+  const shapedQuery = (p) => {
+    if (!blend) return p.query
+    const sid = p.fromSession ?? p.sessionId
+    if (!sid) return p.query
+    if (!profileCache.has(sid)) profileCache.set(sid, memory.sessionProfileOf(cfg, sid))
+    const prof = profileCache.get(sid)
+    if (!prof) return p.query
+    const share = memory.profileShareOf(1)
+    return memory.blendQuery(p.query, prof, { share })
+  }
   const queryIds = (q) => {
     if (!results.has(q)) results.set(q, memory.search(cfg, q, { k, mode }).map((e) => e.id))
     return results.get(q)
@@ -207,7 +220,7 @@ export function runEval(cfg, golden, { k = EVAL_K, mode = memory.DEFAULT_SCORE_M
   const rankSum = { all: 0, n: 0, cross: 0, nCross: 0 }   // MRR 累加（1/rank，未命中记 0）
   let top1 = { all: 0, cross: 0 }
   for (const p of golden.positives) {
-    const ids = queryIds(p.query)
+    const ids = queryIds(shapedQuery(p))
     const rank = ids.indexOf(p.expectId)          // -1 = 未命中
     const hit = rank >= 0
     const rr = hit ? 1 / (rank + 1) : 0
@@ -217,7 +230,7 @@ export function runEval(cfg, golden, { k = EVAL_K, mode = memory.DEFAULT_SCORE_M
     byKind[p.kind] ??= { total: 0, hits: 0 }
     byKind[p.kind].total++
     if (hit) { hits++; byKind[p.kind].hits++ } else {
-      misses.push({ query: p.query.slice(0, 80), expectId: p.expectId, got: ids.slice(0, 3) })
+      misses.push({ query: shapedQuery(p).slice(0, 80), expectId: p.expectId, got: ids.slice(0, 3) })
     }
   }
   const penetrationDetails = []
