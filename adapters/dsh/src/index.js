@@ -61,7 +61,7 @@ const DEFAULTS = {
   memoryExtract: true,         // compaction/summary → 确定性提取入库（搭 DSH 内置摘要便车，零 LLM 调用）
   memoryExtractIncremental: true, // 增量熔炼臂：pre-step 水位线扫新增 user/assistant 轮次提取入库
   foldMode: 'shadow',           // warm folding：off|shadow|active——把已蒸馏旧轮次折叠成指针行（记忆替代 token）
-  foldMinChars: 200,            // 短于此不折（指针行本身有成本，折叠不划算）
+  foldMinChars: 120,            // 成本下限：真实对话消息 p75=117（更大者才值得用 45 字符指针替换）
   foldKeepLastTurns: 4,         // 最新 N 个对话节点永不折叠（活跃上下文）
   memoryInjectMode: 'shadow',  // 记忆注入单独模式：shadow 只记账；active 在请求尾部追加检索块（前缀安全）
   memoryInjectMaxEntries: 6,   // 注入块条目上限（预算纪律：注入自身不能成为体积源）
@@ -227,6 +227,7 @@ export function apply(ctx, config = {}) {
   const preStepSeen = new Set()    // 已经历过 pre-step 的会话（继承冷启动窗口只在首个 pre-step 有效）
   const lastInjectDigest = new Map() // sessionId → 上次注入的条目 digest（内容没变不重复注入）
   const extractWatermark = new Map() // sessionId → 已熔炼到的最大 seq（持久化在 meterDir，重启不重扫）
+  const distilledSeqs = new Map()    // sessionId → Set(确实产出了记忆条目的 seq)——折叠的真正依据
   let watermarkLoaded = false
   // 计量统一落全局根（默认 ~/.lcm，LCM_METER_ROOT / cordis 配置可覆盖），
   // 事件带 project 字段（会话 cwd）——此前按会话 cwd + 服务器 cwd 分散落点，
@@ -343,7 +344,12 @@ export function apply(ctx, config = {}) {
   // shadow 模式完整计算并记账，但不改写历史。任何异常 → 放行（next()）。
   /** 剪枝臂主体（独立函数：早退不影响注入流程）。 */
   // ---- warm folding 折叠臂：把「已蒸馏至记忆库」的旧轮次折叠成指针行 ----
-  // 纪律：只折 seq ≤ 熔炼水位线的轮次（信息已在记忆库，折叠=替代而非丢失）；
+  // 纪律：只折**确实产出了记忆条目**的轮次（distilledSeqs，指针必须指向真实存在的
+  // 记忆）；字符阈值只是成本下限。实测覆盖限制（2026-09-15，真实会话回放）：
+  // 产出条目的轮次往往是短的高密度陈述（<120 字符）→ 该会话零可折对象；
+  // 长 assistant 散文多被质量门槛拒（不产出条目 → 不可折，安全优先）。
+  // 要提高折叠覆盖 → 提高熔炼覆盖率（放宽门槛/换提取策略），而不是放宽折叠门槛。
+  // 原纪律保留：seq ≤ 熔炼水位线（信息已在记忆库，折叠=替代而非丢失）；
   // 只在冷窗口调用（piggyback）；最新 foldKeepLastTurns 轮永不折叠（活跃上下文）；
   // 指针行替换走 surfaceOp replace——只改模型可见层，持久日志完好可回放。
   const runFold = (agent, sessionKey) => {
@@ -351,10 +357,18 @@ export function apply(ctx, config = {}) {
     const session = agent?.session
     if (!session?.surface || typeof session.append !== 'function') return
     const watermark = extractWatermark.get(sessionKey) ?? -1
-    if (watermark < 0) return                        // 熔炼臂没跑过 → 无可折叠对象（安全默认）
+    const distilled = distilledSeqs.get(sessionKey)
+    const dbg = process.env.LCM_DEBUG_FOLD === '1'
+    if (dbg) ctx.logger.info(`dsh-lcm fold[debug]: watermark=${watermark} distilled=${distilled?.size ?? 0}`)
+    if (watermark < 0 || !distilled || distilled.size === 0) {
+      if (dbg) ctx.logger.info('dsh-lcm fold[debug]: 无已蒸馏轮次，跳过')
+      return
+    }
+    // 折叠依据 = 该轮确实产出了记忆条目（指针指向真实存在的记忆）；
+    // 字符阈值只是成本下限（指针行本身 ~45 字符）
     const chatSeqs = [...session.surface.nodes]
       .filter((seq) => {
-        if (seq > watermark) return false            // 未蒸馏的不折
+        if (seq > watermark || !distilled.has(seq)) return false
         const e = session.eventAt?.(seq)
         return e?.type === 'user/message' || e?.type === 'assistant/message'
       })
@@ -370,7 +384,7 @@ export function apply(ctx, config = {}) {
       const t = isUser ? flattenTextBlocks(event.data?.content) : flattenTextBlocks(event.data?.message?.content)
       if (!t) continue
       const chars = [...t].length
-      if (chars < cfg.foldMinChars) continue
+      if (chars < cfg.foldMinChars) { if (dbg) ctx.logger.info(`dsh-lcm fold[debug]: seq=${seq} 太短 ${chars}<${cfg.foldMinChars}`); continue }
       const pointer = `[轮 ${seq}·${isUser ? 'user' : 'assistant'} 已蒸馏至记忆库；原文 ${chars} 字符在会话日志完好]`
       folded++; charsBefore += chars; charsAfter += [...pointer].length
       if (isShadow) continue
@@ -387,6 +401,7 @@ export function apply(ctx, config = {}) {
         }, { surfaceOp: { op: 'replace', start: seq, end: seq }, sourceEventSeqs: [seq] })
       }
     }
+    if (dbg) ctx.logger.info(`dsh-lcm fold[debug]: 候选 ${chatSeqs.length} 保留 ${keep.size} 可折 ${folded}`)
     if (folded === 0) return
     meter.record(meterBase, {
       kind: 'fold', sessionId: sessionKey, mode: cfg.foldMode,
@@ -535,7 +550,7 @@ export function apply(ctx, config = {}) {
     const sessionKey = session.header?.id ?? 'unknown'
     const lastSeq = extractWatermark.get(sessionKey) ?? -1
     let maxSeq = lastSeq
-    let stored = 0, rejected = 0, scanned = 0
+    let stored = 0, rejected = 0, scanned = 0, producedAny = false
     const capLeft = { n: 24 }   // 每步候选总上限（防多 step 爆发）
     for (const seq of [...session.surface.nodes]) {
       if (seq <= lastSeq) continue
@@ -551,17 +566,26 @@ export function apply(ctx, config = {}) {
       }
       if (!t || capLeft.n <= 0) continue
       scanned++
+      let produced = 0
       for (const c of memory.extractCandidates(t)) {               // 纯内存，零 IO
         if (capLeft.n-- <= 0) break
         const r = memory.record(meterBase, {
           ...c, source: 'incremental', sessionId: sessionKey,
           project: session.header?.cwd ?? null,
         })
-        if (r.action === 'ADD' || r.action === 'UPDATE') stored++
+        if (r.action === 'ADD' || r.action === 'UPDATE') { stored++; produced++ }
+        // 知识已在库里（完全相同或等价）→ 指针有效，可折叠
+        else if (r.action === 'NOOP' && (r.reason === 'id-exists' || r.reason === 'equivalent')) produced++
         else if (r.action === 'REJECT') rejected++
       }
+      // 只有真产出条目的轮次才可折叠（指针必须指向确实存在的记忆）
+      if (produced > 0) {
+        if (!distilledSeqs.has(sessionKey)) distilledSeqs.set(sessionKey, new Set())
+        distilledSeqs.get(sessionKey).add(seq)
+        producedAny = true
+      }
     }
-    if (maxSeq !== lastSeq) {
+    if (maxSeq !== lastSeq || producedAny) {
       extractWatermark.set(sessionKey, maxSeq)
       saveWatermarks()
     }
@@ -574,13 +598,23 @@ export function apply(ctx, config = {}) {
   function loadWatermarks() {
     try {
       const data = JSON.parse(readFileSync(watermarkFile(), 'utf8'))
-      for (const [k, v] of Object.entries(data)) if (Number.isFinite(v)) extractWatermark.set(k, v)
+      for (const [k, v] of Object.entries(data)) {
+        if (Number.isFinite(v)) { extractWatermark.set(k, v); continue }   // 旧格式兼容
+        if (v && Number.isFinite(v.seq)) {
+          extractWatermark.set(k, v.seq)
+          if (Array.isArray(v.distilled) && v.distilled.length > 0) distilledSeqs.set(k, new Set(v.distilled))
+        }
+      }
     } catch { /* 无水位线文件：从头扫（幂等兜住重扫） */ }
   }
   function saveWatermarks() {
     try {
       mkdirSync(meterBase.meterDir, { recursive: true })
-      writeFileSync(watermarkFile(), JSON.stringify(Object.fromEntries(extractWatermark)), 'utf8')
+      const out = {}
+      for (const [k, v] of extractWatermark) {
+        out[k] = { seq: v, distilled: [...(distilledSeqs.get(k) ?? [])].slice(-200) }
+      }
+      writeFileSync(watermarkFile(), JSON.stringify(out), 'utf8')
     } catch { /* 只读环境静默 */ }
   }
 

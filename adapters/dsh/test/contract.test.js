@@ -719,7 +719,8 @@ test('增量熔炼臂：水位线持久化——重启（新 apply）后不重�
   assert.ok(live1.length >= 1)
   // 水位线文件存在
   const wm = JSON.parse(readFileSync(join(lcmRoot, '.lcm', 'extract-watermark.json'), 'utf8'))
-  assert.ok(wm['sess-prune'] >= 1, '水位线必须持久化')
+  assert.ok(wm['sess-prune'].seq >= 1, '水位线必须持久化（{seq, distilled} 格式）')
+  assert.ok(Array.isArray(wm['sess-prune'].distilled), '已蒸馏 seq 随水位线一起持久化（折叠依据）')
 
   // 「重启」：新 apply（新 Map），同会话同消息 → 从文件恢复水位线，零新写入
   const ctx2 = fakeCtx()
@@ -743,8 +744,12 @@ test('增量熔炼臂：无新增轮次零副作用；关闭开关后完全停�
 
 // ---------------------------------------------------------------- warm folding 折叠臂
 
-const LONG_A = '这是一条足够长的用户消息，用来测试折叠臂的长度门槛。'.repeat(12)   // ~300 chars
-const LONG_B = '这是一段足够长的助手回复内容，包含分析过程与结论的详细展开说明。'.repeat(12)
+// 可产出条目的长文本（含量化信号与路径 → 过增量熔炼的质量门槛）：
+// 折叠的前提是「该轮确实产出了记忆条目」，纯长文本（无信号）不该被折叠——测试锁这条
+const DISTILL = '决定：折叠臂只折已蒸馏轮次，阈值 120 字符（依据 core/memory.mjs 分位数据），v0.3 上线。'
+const LONG_A = DISTILL + '补充：' + '内容填充用于超过长度门槛，同时保持可提取的信号密度。'.repeat(6)
+const LONG_B = DISTILL + '回复：' + '助手侧的详细展开说明，含数据与结论，用于验证折叠保护集。'.repeat(6)
+const PLAIN_LONG = '这是一条足够长但没有任何可提取信号的普通文本，不应该被折叠。'.repeat(12)
 
 function foldSession(lcmRoot, n = 8) {
   const entries = []
@@ -758,7 +763,7 @@ test('折叠臂 shadow（默认）：冷窗口记账但不替换 surface', async
   applyT(ctx, { mode: 'active', lcmRoot })
   withTokenMeter(ctx, 150_000)
   const session = foldSession(lcmRoot)
-  await runPreStep(ctx, session)                                  // 建熔炼水位线
+  await runPreStep(ctx, session)                                  // 建熔炼水位线 + 已蒸馏 seq
   emitSessionEvent(ctx, session, { type: 'compaction/basic' })    // 打开冷窗口
   await runPreStep(ctx, session)
   const folds = readMeterEvents(lcmRoot, 'fold')
@@ -775,14 +780,14 @@ test('折叠臂 active：指针行替换 + 最新 4 轮保留 + 短消息与插�
   applyT(ctx, { mode: 'active', lcmRoot, foldMode: 'active' })
   withTokenMeter(ctx, 150_000)
   const entries = [
-    userMsgEvent(LONG_A),                          // seq1 可折
-    assistantMsgEvent(LONG_B),                     // seq2 可折
+    userMsgEvent(LONG_A + '一'),                    // seq1 可折
+    assistantMsgEvent(LONG_B + '二'),               // seq2 可折
     userMsgEvent('短消息'),                          // seq3 太短不折
     userMsgEvent(LONG_A + '插件注入版本', 'plugin'),  // seq4 插件消息不折
-    assistantMsgEvent(LONG_B + '甲'),                // seq5 可折
-    userMsgEvent(LONG_A + '乙'),                    // seq6 可折
-    assistantMsgEvent(LONG_B + '丙'), userMsgEvent(LONG_A + '丁'),  // seq7-10 最新 4 轮保留
-    assistantMsgEvent(LONG_B + '戊'), userMsgEvent(LONG_A + '己'),
+    assistantMsgEvent(LONG_B + '五'),                // seq5 可折
+    userMsgEvent(LONG_A + '六'),                    // seq6 可折
+    assistantMsgEvent(LONG_B + '七'), userMsgEvent(LONG_A + '八'),  // seq7-10 最新 4 轮保留
+    assistantMsgEvent(LONG_B + '九'), userMsgEvent(LONG_A + '十'),
   ]
   const session = fakeSession(lcmRoot, entries)
   await runPreStep(ctx, session)                                  // 水位线 = 10

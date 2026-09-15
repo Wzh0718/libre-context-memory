@@ -1,7 +1,7 @@
 {
   "name": "dsh-lcm",
-  "version": "0.2.0",
-  "description": "libre-context-memory DSH adapter: semantic compression of oversized tool results with spill-handle retrieval (shadow mode by default)",
+  "version": "0.3.0",
+  "description": "libre-context-memory DSH adapter: five-arm token reduction (compression, piggyback pruning, observation, static trim, memory) with deterministic distillation, profile injection and warm folding",
   "type": "module",
   "main": "src/index.js",
   "exports": {
