@@ -5,3 +5,4 @@ dist/
 .npm-cache/
 .bench-lcm/
 .demo-lcm/
+.eval-lcm/
