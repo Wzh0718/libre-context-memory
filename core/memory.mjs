@@ -103,7 +103,7 @@ function normalizeCandidate(cand) {
   const type = TYPE_RE.test(cand?.type ?? '') ? cand.type : 'fact'
   const subject = String(cand?.subject ?? '').trim().slice(0, 80)
   const claim = String(cand?.claim ?? '').trim().slice(0, 400)
-  if (!subject || !claim) return null
+  if (!claim) return null   // subject 允许为空（无锚点条目——显示与检索都已适配）
   return {
     type, subject, claim,
     keywords: (cand.keywords ?? []).map(String).slice(0, 8),
@@ -120,6 +120,10 @@ function normalizeCandidate(cand) {
  * 写入决策（mem0 式四选一）。
  * @returns {{action:'ADD'|'UPDATE'|'NOOP'|'DELETE'|'REJECT', id?:string, reason?:string, entry?:object}}
  */
+/** 质量门槛按来源分层：LLM 蒸馏过的 summary 宽松；原始对话轮严格（噪声大）；手动不设限。 */
+const QUALITY_GATE = { 'compaction/summary': 0.45, manual: 0 }
+const DEFAULT_QUALITY_GATE = 0.6
+
 export function record(cfg, cand, { now = Date.now() } = {}) {
   const c = normalizeCandidate(cand)
   if (c === null) return { action: 'REJECT', reason: 'invalid' }
@@ -127,6 +131,13 @@ export function record(cfg, cand, { now = Date.now() } = {}) {
   if (blocked) {
     meter.record(cfg, { kind: 'memory', action: 'REJECT', reason: blocked, type: c.type, subject: c.subject })
     return { action: 'REJECT', reason: blocked }
+  }
+  // 质量门槛：低分候选挡在库门外（原因带分数，benchmark/report 可观测）
+  const score = typeof cand.score === 'number' ? cand.score : qualityScore(c)
+  const gate = QUALITY_GATE[c.source ?? ''] ?? DEFAULT_QUALITY_GATE
+  if (score < gate) {
+    meter.record(cfg, { kind: 'memory', action: 'REJECT', reason: 'low-quality', score, gate, type: c.type, subject: c.subject })
+    return { action: 'REJECT', reason: `low-quality(score ${score} < gate ${gate})`, score, gate }
   }
   const id = entryId(c.type, c.subject, c.claim)
   const all = loadAll(cfg)
@@ -147,7 +158,7 @@ export function record(cfg, cand, { now = Date.now() } = {}) {
     }
     if (sim >= 0.25) { action = 'UPDATE'; supersedes = old.id }
   }
-  const entry = { id, ...c, ts: now, status: action === 'DELETE' ? 'refuted' : 'active', supersedes }
+  const entry = { id, ...c, score, ts: now, status: action === 'DELETE' ? 'refuted' : 'active', supersedes }
   if (action === 'UPDATE') {
     const old = all.find((e) => e.id === supersedes)
     if (old) old.superseded_by = id
@@ -211,12 +222,18 @@ export function search(cfg, query, { k = 6, maxChars = 2_500 } = {}) {
 }
 
 /** 注入块确定性渲染：同条目集 → 逐字节相同（尾部追加纪律的前提）。 */
+/** 显示文本：claim 已含 subject 信息（或 subject 为空）时只显示 claim，避免「X：X…」冗余。 */
+function displayOf(e) {
+  if (!e.subject) return e.claim
+  return e.claim.startsWith(e.subject.slice(0, 20)) ? e.claim : `${e.subject}：${e.claim}`
+}
+
 export function renderInjectBlock(query, entries) {
   if (entries.length === 0) return null
   const lines = [`<lcm-memory query="${String(query).slice(0, 80).replace(/"/g, '\'')}">`]
   for (const e of entries) {
     const date = new Date(e.ts ?? 0).toISOString().slice(0, 10)
-    lines.push(`- [${e.type}] ${e.subject}：${e.claim}（${date}，id:${e.id}）`)
+    lines.push(`- [${e.type}] ${displayOf(e)}（${date}，id:${e.id}）`)
   }
   lines.push('</lcm-memory>')
   return lines.join('\n')
@@ -242,7 +259,7 @@ export function entryMarkdown(e) {
   const rows = [
     `# [${e.type}] ${e.subject}`, '',
     `- claim: ${e.claim}`,
-    `- confidence: ${e.confidence ?? 0.7} ｜ ttl: ${e.ttl ?? 'durable'} ｜ id: ${e.id}`,
+    `- score: ${e.score ?? '-'} ｜ ttl: ${e.ttl ?? 'durable'} ｜ id: ${e.id}`,
     `- source: ${e.source}${e.project ? ` ｜ project: ${e.project}` : ''}`,
   ]
   if (e.supersedes) rows.push(`- supersedes: ${e.supersedes}`)
@@ -311,13 +328,37 @@ export async function flushOutbox(cfg) {
 
 const DECISION_RE = /(决定|拍板|选定|选择|改用|换成|放弃|不用|采用|已切|decided|chose|switch(?:ed)? to|settled on|adopted|we use|改为)/
 const THREAD_RE = /(TODO|待办|待验证|未完成|下一步|接下来要|next step|pending|follow-up|遗留)/
-const CONCLUSION_RE = /(实测|验证了|结论|表明|证明|measured|verified|turned out|confirms?)[：:]?\s*\S*\s*\d|(\d+(?:\.\d+)?%|[0-9,]{4,})/
+// 结论需要显式结论词或百分比——纯 4 位数字（日期/序号）不算量化证据
+const CONCLUSION_RE = /(实测|验证了|结论[是是：:]|表明|证明|发现[一一个]?|measured|verified|turned out|confirms?)|\d+(?:\.\d+)?%/
 const FACT_PATH_RE = /(?:\/[\w.-]+){2,}|[\w.-]+\.(?:md|json|ya?ml|toml|py|js|mjs|ts|go|rs)\b/
+
+/** 类型权重（用户确认：decision 1.0 / conclusion 0.9 / preference 0.85 / fact 0.8 / open_thread 0.6）。 */
+export const TYPE_WEIGHT = { decision: 1.0, conclusion: 0.9, preference: 0.85, fact: 0.8, open_thread: 0.6 }
+
+/** 信号密度：路径/代码锚/百分比/版本号加分；表格残片/超长碎片减分。全部确定性。 */
+export function signalDensity(claim) {
+  let s = 0.5
+  if (/(?:\/[\w.-]+){2,}|[\w.-]+\.(?:md|json|ya?ml|toml|py|js|mjs|ts|go|rs)\b/.test(claim)) s += 0.2   // 文件路径/文件名（与 FACT_PATH_RE 同口径）
+  if (/`[^`]{3,}`/.test(claim)) s += 0.15              // 代码锚
+  if (/\d+(?:\.\d+)?%/.test(claim)) s += 0.15          // 百分比（量化证据）
+  if (/v?\d+\.\d+/.test(claim)) s += 0.1               // 版本号
+  if (/https?:\/\//.test(claim)) s += 0.1              // URL
+  if ((claim.match(/\|/g) ?? []).length >= 2) s -= 0.3 // 表格残片
+  if (claim.length > 320) s -= 0.2                     // 超长碎片
+  return Math.min(1, Math.max(0.1, s))
+}
+
+/** 写入质量分 = 类型权重 × 信号密度。这是入库门槛和将来画像晋升的依据。 */
+export function qualityScore(c) {
+  return Math.round((TYPE_WEIGHT[c.type] ?? 0.7) * signalDensity(c.claim) * 100) / 100
+}
 
 /**
  * 确定性提取：从（折叠摘要/对话）文本里挑记忆候选，零 LLM 调用。
  * compaction/summary 的分节 markdown 尤其友好：小节标题映射类型，列表项即候选。
- * @returns Array<{type, subject, claim, keywords, evidence, confidence}>
+ * 质量纪律（benchmark 驱动）：表格行整行跳过（脱离表头无语义）、引用前缀清理、
+ * 无锚点不再截断 claim 当 subject（零信息且检索重复计权）、每候选带质量分。
+ * @returns Array<{type, subject, claim, keywords, evidence, score}>
  */
 export function extractCandidates(text) {
   const src = String(text ?? '')
@@ -331,22 +372,27 @@ export function extractCandidates(text) {
     if (!line) continue
     const heading = /^(#{1,4})\s+(.*)$/.exec(line)
     if (heading) { section = heading[2].toLowerCase(); continue }
-    if (!/^[-*•]\s+/.test(line) && line.length > 240) continue   // 只要列表项（摘要形态）或短行
-    const body = line.replace(/^[-*•]\s+/, '')
+    if (line.startsWith('|')) continue   // 表格行：脱离表头的单元格没有独立语义
+    const isListItem = /^[-*•]\s+/.test(line)
+    if (!isListItem && line.length > 240) continue   // 只要列表项（摘要形态）或短行
+    const body = line.replace(/^[-*•]\s+/, '').replace(/^>\s?/, '').trim()   // 清引用块标记
+    if (!body) continue
     const type = classify(body, section)
     if (type === null) continue
     const claim = body.slice(0, 400)
     const key = claim.toLowerCase().replace(/\s+/g, '')
     if (seen.has(key)) continue
     seen.add(key)
-    candidates.push({
+    const cand = {
       type,
-      subject: subjectOf(body) || section || 'general',
+      subject: subjectOf(body) || section || '',
       claim,
       keywords: [],
       evidence: [],
-      confidence: type === 'conclusion' ? 0.8 : 0.6,
-    })
+      score: 0,
+    }
+    cand.score = qualityScore(cand)
+    candidates.push(cand)
     if (candidates.length >= 12) break
   }
   return candidates
@@ -363,8 +409,9 @@ function classify(body, section) {
 }
 
 function subjectOf(body) {
-  // 取路径/URL/反引号片段做主题锚；否则截前 40 字符
+  // 取路径/URL/反引号片段做主题锚；无锚返回 null（不截断 claim 冒充 subject——
+  // 那是零信息锚点，且检索时 subject×3 权重会重复放大 claim 头部）
   const anchor = /`([^`]{3,60})`/.exec(body) ?? FACT_PATH_RE.exec(body) ?? /https?:\/\/[\w./-]+/.exec(body)
   if (anchor) return String(anchor[1] ?? anchor[0]).slice(0, 60)
-  return body.slice(0, 40)
+  return null
 }

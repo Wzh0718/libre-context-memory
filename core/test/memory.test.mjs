@@ -210,3 +210,65 @@ test('端到端：summary 提取 → 逐条入库（四选一去重）→ 可检
   assert.equal(memory.activeEntries(cfg).length, added)
   assert.ok(memory.search(cfg, 'compaction summary 折叠').length > 0)
 })
+
+// ---------------------------------------------------------------- 提取质量（benchmark 驱动修复）
+
+test('提取质量：表格行不提取、引用前缀清理、无锚 subject 不冒充', () => {
+  const cfg = makeCfg()
+  // 表格行（benchmark 实测 25.5% 噪声源）：脱离表头没有独立语义
+  const cands = memory.extractCandidates(`
+| **重复付费**：缓存击穿 | 4,039 次「零新内容全价」= 455M fresh |
+| **体积失控**：0.3% 工具输出占 55.5% | 84 次大输出 |
+- 实测：Codex 每请求新增内容中位数只有 679 est tokens（98.6% 请求与上轮逐字节同前缀）
+> 结论：压缩必须入库即做，不能等窗口
+`)
+  assert.equal(cands.filter((c) => c.claim.startsWith('|')).length, 0, '表格行必须整行跳过')
+  const quoted = cands.find((c) => c.claim.startsWith('结论'))
+  assert.ok(quoted, '引用块内容要提取：' + JSON.stringify(cands.map((c) => c.claim.slice(0, 20))))
+  // 无锚点（无路径/反引号/URL）→ subject 为空，不得截断 claim 冒充
+  const noAnchor = memory.extractCandidates('- 实测：这个结论没有任何路径锚点 87% 但有百分比')[0]
+  assert.equal(noAnchor.subject, '', '无锚 subject 必须为空（benchmark 冗余 53.4% 的根因）')
+  // 有锚（反引号）→ subject 是锚
+  const anchored = memory.extractCandidates('- 决定：改用 `core/memory.mjs` 做提取入口')[0]
+  assert.equal(anchored.subject, 'core/memory.mjs')
+})
+
+test('质量门槛：低分候选挡在库门外，门槛按来源分层', () => {
+  const cfg = makeCfg()
+  // 无任何信号锚的纯散文碎片：density 0.5 × 类型权重 → 低分
+  const weak = { type: 'open_thread', subject: '', claim: '接下来要做的事情还有很多需要慢慢验证', score: 0.3, source: 'incremental' }
+  const r = memory.record(cfg, weak)
+  assert.equal(r.action, 'REJECT')
+  assert.match(r.reason, /low-quality/)
+  assert.ok(r.score < r.gate, '拒绝原因必须带分数')
+  // 同样内容来自 LLM 蒸馏的 summary（门槛 0.45）+ 过线分数 → 入库
+  const ok = memory.record(cfg, { ...weak, score: 0.5, source: 'compaction/summary' })
+  assert.equal(ok.action, 'ADD')
+  // 手动写入不设限（不同 claim 避开上面的幂等键）
+  const manual = memory.record(cfg, { ...weak, claim: '另一个低分内容但用户手动指定入库的条目', source: 'manual' })
+  assert.equal(manual.action, 'ADD')
+  // 分数持久化在条目上（画像晋升的依据）
+  assert.equal(manual.entry.score, 0.3)
+  // 同 claim 重复写入 → 幂等 NOOP（不管来源）
+  assert.equal(memory.record(cfg, { ...weak, score: 0.5, source: 'compaction/summary' }).action, 'NOOP')
+})
+
+test('质量分：类型权重 × 信号密度，序关系稳定', () => {
+  const claim = '实测 `core/mjs` 路径 v1.2 与 95% 百分比锚'
+  const d = memory.qualityScore({ type: 'decision', claim })
+  const o = memory.qualityScore({ type: 'open_thread', claim })
+  assert.ok(d > o, '同密度下 decision > open_thread')
+  const rich = memory.qualityScore({ type: 'fact', claim })
+  const plain = memory.qualityScore({ type: 'fact', claim: '这是一个没有任何具体锚点的普通描述句子' })
+  assert.ok(rich > plain, '有信号锚 > 纯散文')
+  assert.ok(plain <= 0.5, '纯散文分数压在门槛下')
+})
+
+test('显示去重：claim 已含 subject 信息时不重复拼接', () => {
+  const cfg = makeCfg()
+  memory.record(cfg, { type: 'fact', subject: '', claim: '实测显示去重：没有锚点的条目直接显示 claim 全文', source: 'manual' })
+  const [e] = memory.activeEntries(cfg)
+  const block = memory.renderInjectBlock('显示 去重', [e])
+  assert.ok(block.includes(e.claim))
+  assert.ok(!block.includes(`${e.subject}：${e.claim}`), 'subject 为空不得拼出「：」前缀')
+})

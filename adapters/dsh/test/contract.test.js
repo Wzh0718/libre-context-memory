@@ -494,7 +494,7 @@ const SUMMARY_EVENT = {
   data: {
     summary: [{ type: 'text', text: `## Primary Request and Intent
 - Original goal: 通过 dsh 采集 session 数据，研究 memory 管理
-- 下一步：验证记忆注入的检索质量
+- 下一步：验证 docs/04-memory.md 的注入检索质量（当前命中 87%）
 
 ## Key Technical Concepts
 - 记忆库位置 /home/libre/.lcm/memories 全局共享
@@ -518,8 +518,19 @@ test('记忆提取臂：compaction/summary → 确定性提取入库 + meter 记
   const live = activeEntries(lcfg(lcmRoot))
   assert.ok(live.length >= 3, `应有提取产出（实际 ${live.length}）`)
   assert.ok(live.every((e) => e.source === 'compaction/summary'))
-  assert.ok(live.some((e) => e.type === 'open_thread'), '「下一步」→ open_thread')
+  assert.ok(live.some((e) => e.type === 'open_thread'), '「下一步」→ open_thread（有文件名锚）')
   assert.ok(live.some((e) => e.type === 'fact' || e.type === 'decision'))
+  // 质量纪律：无锚的 Original goal（纯散文 intent，0.6×0.5=0.3 < 0.45）必须被低分拒绝
+  const rejects = readMeterEvents(lcmRoot, 'memory').filter((e) => e.action === 'REJECT' && e.reason === 'low-quality')
+  assert.equal(rejects.length, 1, '无锚 open_thread 恰好一条被质量门槛拒绝' + JSON.stringify(readMeterEvents(lcmRoot, 'memory').map((e) => e.action + e.reason)))
+  // 分层门槛：无锚的纯散文候选即使在 summary 里也会被低分拒绝（质量纪律）
+  {
+    const cfg0 = lcfg(lcmRoot)
+    const weak = { type: 'open_thread', subject: '', claim: '接下来要慢慢验证还有很多事情', source: 'compaction/summary' }
+    const mem0 = await import('../../../core/memory.mjs')
+    const r = mem0.record(cfg0, { ...weak, score: mem0.qualityScore(weak) })
+    assert.equal(r.action, 'REJECT', '无锚 open_thread 的质量分必须低于 summary 门槛 0.45')
+  }
   // meter 有 memory 事件
   const mem = readMeterEvents(lcmRoot, 'memory')
   assert.ok(mem.length >= 3)

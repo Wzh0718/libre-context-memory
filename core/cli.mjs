@@ -363,7 +363,7 @@ async function main() {
       for (const e of rows) {
         const date = new Date(e.ts ?? 0).toISOString().slice(0, 10)
         const flag = e.superseded_by ? '（已取代）' : ''
-        console.log(`${date} [${e.type}] ${e.subject}：${e.claim}${flag}  (${e.id})`)
+        console.log(`${date} [${e.type}] ${e.claim.startsWith(String(e.subject).slice(0, 20)) || !e.subject ? e.claim : e.subject + '：' + e.claim}${flag}  (${e.id})`)
       }
       console.error(`[lcm] ${rows.length} 条${args.all ? '（含历史）' : ''}`)
       return 0
