@@ -390,6 +390,13 @@ async function main() {
       console.error(`[lcm] ${rows.length} 条${args.all ? '（含历史）' : ''}`)
       return 0
     }
+    if (sub === 'sweep') {
+      const r = mem.enforceCapacity(cfg, { maxEntries: Number(args.max ?? mem.MEMORY_MAX_ENTRIES), dryRun: Boolean(args['dry-run']) })
+      console.log(`[lcm] 记忆库容量：活跃 ${r.live} 条 / ${(r.bytes / 1024).toFixed(1)} KB`
+        + `（上限 ${mem.MEMORY_MAX_ENTRIES} 条 / ${(mem.MEMORY_MAX_BYTES / 1024 / 1024).toFixed(0)} MB）`
+        + `${r.over ? `｜归档 ${r.archived} 条${args['dry-run'] ? '（dry-run，未落盘）' : ''}` : '｜未超限，零改动'}`)
+      return 0
+    }
     if (sub === 'pin' || sub === 'unpin') {
       if (!args.id) { console.error(`用法: lcm memory ${sub} --id <条目 id>`); return 2 }
       const r = mem.setProfile(cfg, args.id, sub === 'pin')

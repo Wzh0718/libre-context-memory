@@ -90,7 +90,7 @@ export function activeEntries(cfg) {
 function activeEntriesFrom(all) {
   const dead = new Set()
   for (const e of all) if (e.superseded_by) dead.add(e.id)   // e.id 被取代 → 死；取代者本身活着
-  return all.filter((e) => !dead.has(e.id) && e.status !== 'refuted')
+  return all.filter((e) => !dead.has(e.id) && e.status !== 'refuted' && e.status !== 'archived')
 }
 
 function persist(cfg, all) {
@@ -174,6 +174,8 @@ export function record(cfg, cand, { now = Date.now() } = {}) {
   }
   all.push(entry)
   persist(cfg, all)
+  // 容量治理：超限才动（enforceCapacity 首行是廉价判断）
+  try { enforceCapacity(cfg, { now }) } catch { /* 治理失败不得影响写入 */ }
   meter.record(cfg, { kind: 'memory', action, id, type: c.type, subject: c.subject })
   queueSync(cfg, entry)
   return { action, id, entry }
@@ -254,6 +256,54 @@ export function readScore(e, q, { now = Date.now(), qualityBoost = 1, mode = DEF
     default:
       return rel + (ageDays < 1 ? 0.5 : 0)
   }
+}
+
+// ---------------------------------------------------------------- 容量上限（B5）
+
+/** 记忆库容量：活跃条目数与库体字节双封顶（防无界增长）。 */
+export const MEMORY_MAX_ENTRIES = 2_000
+export const MEMORY_MAX_BYTES = 4 * 1024 * 1024
+
+/** 归档价值：分数 × 新鲜度（与读分同构，保证「先淘汰最没用的」）。 */
+function archiveValue(e, now) {
+  const ageDays = Math.max(0, (now - Math.max(e.lastSeenAt ?? 0, e.ts ?? 0)) / 86_400_000)
+  const recency = 0.7 + 0.3 * 2 ** (-ageDays / RECENCY_HALF_LIFE_DAYS)
+  return (typeof e.score === 'number' ? e.score : 0.6) * recency
+}
+
+/**
+ * 容量治理：超限时把最没用的活跃条目置为 archived（保留审计，不物理删除）。
+ * 纪律：
+ * - 画像条目（含 pin）永不归档——用户显式关心的内容优先
+ * - ttl='session' 的条目先归档（本来就不该长期占位）
+ * - 其余按 归档价值 升序淘汰（分数低 + 久未复现的先走）
+ * - 幂等：未超限时零写入；同输入同结果（确定性）
+ */
+export function enforceCapacity(cfg, { now = Date.now(), maxEntries = MEMORY_MAX_ENTRIES, maxBytes = MEMORY_MAX_BYTES, dryRun = false } = {}) {
+  const all = loadAll(cfg)
+  const live = activeEntriesFrom(all)
+  const bytes = Buffer.byteLength(all.map((e) => JSON.stringify(e)).join('\n') + '\n', 'utf8')
+  if (live.length <= maxEntries && bytes <= maxBytes) return { archived: 0, live: live.length, bytes, over: false }
+
+  const sessionTtl = live.filter((e) => e.ttl === 'session' && e.profile !== true)
+  const rest = live.filter((e) => e.ttl !== 'session' && e.profile !== true)
+    .sort((a, b) => archiveValue(a, now) - archiveValue(b, now) || (a.ts ?? 0) - (b.ts ?? 0) || (a.id < b.id ? -1 : 1))
+  const drop = [...sessionTtl, ...rest]
+  // 清到低水位（90% 上限）——避免每次写入都触发一遍扫描
+  const lowWater = Math.max(1, Math.floor(maxEntries * 0.9))
+  const count = live.length > maxEntries ? live.length - lowWater : Math.ceil(live.length * 0.1)
+  const picks = drop.slice(0, count)
+  if (!dryRun) {
+    for (const e of picks) {
+      const rec = all.find((x) => x.id === e.id)
+      if (rec) { rec.status = 'archived'; rec.archivedAt = now }
+    }
+    if (picks.length > 0) persist(cfg, all)
+  }
+  if (picks.length > 0) {
+    meter.record(cfg, { kind: 'memory-capacity', archived: picks.length, live: live.length - picks.length, bytes, dryRun: Boolean(dryRun) })
+  }
+  return { archived: picks.length, live: live.length - picks.length, bytes, over: true }
 }
 
 // ---------------------------------------------------------------- 画像条目（A3/B4）

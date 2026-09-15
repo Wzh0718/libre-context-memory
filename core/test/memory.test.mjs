@@ -475,3 +475,65 @@ test('A3 画像常驻注入段：预算内渲染 + 查询相关优先 + 确定�
   const capped = mem.profileInjectLines(cfg, '提交', { maxChars: 40 })
   assert.ok(capped.length < 2, '字符预算必须生效')
 })
+
+test('B5 容量上限：超限归档最弱者（保留画像/pin）、幂等、未超限零改动', async () => {
+  const mem = await import('../memory.mjs')
+  const r = mkdtempSync(join(tmpdir(), 'lcm-cap-'))
+  const cfg = loadConfig(r, { meterRoot: join(r, '.lcm') })
+  mkdirSync(cfg.memoryDir, { recursive: true })
+  const now = Date.now()
+  // 20 条条目：一条 pin 的画像 + 一条 session TTL + 其余普通
+  const ids = []
+  for (let i = 0; i < 18; i++) {
+    const rec = mem.record(cfg, {
+      type: 'fact', subject: `容量主题${i}`, claim: `容量测试条目 ${i}：内容足够长以通过禁写过滤的长度限制`,
+      score: i < 3 ? 0.4 : 0.9, source: 'manual', sessionId: 's1',
+    }, { now: now - (30 - i) * 86_400_000 })   // 越靠前越旧
+    ids.push(rec.id)
+  }
+  const pinned = mem.record(cfg, {
+    type: 'preference', subject: '容量 pin 条目', claim: '这条被手动 pin，容量治理时绝不能被归档',
+    score: 0.9, source: 'manual', sessionId: 's1',
+  }, { now })
+  mem.setProfile(cfg, pinned.id, true)
+  const sess = mem.record(cfg, {
+    type: 'fact', subject: '容量会话条目', claim: '这条是 session TTL，容量治理时应优先归档',
+    ttl: 'session', score: 0.9, source: 'manual', sessionId: 's1',
+  }, { now })
+
+  // 未超限：零改动（幂等）
+  const r0 = mem.enforceCapacity(cfg, { now, maxEntries: 100 })
+  assert.equal(r0.archived, 0)
+  assert.equal(r0.over, false)
+
+  // 超限：归档到低水位
+  const r1 = mem.enforceCapacity(cfg, { now, maxEntries: 10 })
+  assert.ok(r1.over && r1.archived > 0, '超限必须归档')
+  const live = mem.activeEntries(cfg)
+  assert.ok(live.length <= 10, `活跃数必须降到上限内（实际 ${live.length}）`)
+  const liveIds = live.map((e) => e.id)
+  assert.ok(liveIds.includes(pinned.id), 'pin 的画像条目不得被归档')
+  assert.ok(!liveIds.includes(sess.id), 'session TTL 条目应优先归档')
+  // 归档而非删除：记录仍在（可审计）
+  const all = mem.loadAll(cfg)
+  assert.ok(all.some((e) => e.id === sess.id && e.status === 'archived'), '归档保留审计，不物理删除')
+  // dry-run 不落盘
+  const before = mem.activeEntries(cfg).length
+  mem.enforceCapacity(cfg, { now, maxEntries: 5, dryRun: true })
+  assert.equal(mem.activeEntries(cfg).length, before, 'dry-run 不得改动')
+})
+
+test('B5 容量：字节超限也会触发（条目数未超）', async () => {
+  const mem = await import('../memory.mjs')
+  const r = mkdtempSync(join(tmpdir(), 'lcm-cap2-'))
+  const cfg = loadConfig(r, { meterRoot: join(r, '.lcm') })
+  mkdirSync(cfg.memoryDir, { recursive: true })
+  for (let i = 0; i < 12; i++) {
+    mem.record(cfg, {
+      type: 'fact', subject: `字节主题${i}`, claim: `字节容量测试条目 ${i}，内容刻意写长一些以便触发字节上限路径`,
+      score: 0.8, source: 'manual', sessionId: 's1',
+    })
+  }
+  const res = mem.enforceCapacity(cfg, { maxEntries: 10_000, maxBytes: 500 })
+  assert.ok(res.over && res.archived > 0, '字节超限也必须治理')
+})
