@@ -38,7 +38,7 @@ function parseArgs(argv) {
     const a = argv[i]
     if (a.startsWith('--')) {
       const key = a.slice(2)
-      if (['json', 'no-spill', 'dry-run'].includes(key)) args[key] = true
+      if (['json', 'no-spill', 'dry-run', 'rebuild', 'all', 'refresh', 'source'].includes(key) && key !== 'source') args[key] = true
       else args[key] = argv[++i]
     } else args._.push(a)
   }
@@ -389,6 +389,14 @@ async function main() {
       }
       console.error(`[lcm] ${rows.length} 条${args.all ? '（含历史）' : ''}`)
       return 0
+    }
+    if (sub === 'eval') {
+      const ev = await import('./eval.mjs')
+      const golden = ev.loadGolden(cfg, { rebuild: Boolean(args.rebuild) })
+      const r = ev.runEval(cfg, golden, { k: Number(args.k ?? ev.EVAL_K) })
+      if (args.json) { console.log(JSON.stringify(r, null, 2)); return r.ok ? 0 : 1 }
+      console.log(ev.renderEvalReport(r, golden))
+      return r.ok ? 0 : 1
     }
     if (sub === 'search' || sub === 'inject') {
       if (!args.query) { console.error('用法: lcm memory search --query <查询> [--k 6]'); return 2 }
