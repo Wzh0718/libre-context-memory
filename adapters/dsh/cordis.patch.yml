@@ -7,16 +7,19 @@
       config:
         mode: active            # shadow | active
         maxInlineChars: 20000   # 与 core 压缩器 PASSTHROUGH_CHARS 对齐
+        # —— 计量根（全局统一，事件带 project 字段；report/compare 跨项目聚合）——
+        # 默认 ~/.lcm，可用 LCM_METER_ROOT 或此处 meterRoot 覆盖
         # —— 搭便车剪枝臂（piggyback pruning）——
-        # 触发权交给 DSH 内置折叠 / 已观测到的击穿：改写历史的代价（整段前缀全价重发）
-        # 只在缓存本来要失效时支付，避免主动制造昂贵击穿。
+        # 触发权交给 DSH 内置折叠 / 已观测到的击穿 / 继承会话首请求（subagent fork 必冷）：
+        # 改写历史的代价（整段前缀全价重发）只在缓存本来要失效时支付。
         budgetTokens: 100000    # 守卫：会话总量超此值才值得动手（不是触发器）
         targetTokens: 60000     # 剪到此值以下停手（滞回带）
         pruneCooldownTokens: 10000 # 剪过一次后，会话需再长够此值才允许再次剪
         pruneProactive: false   # true=回到主动预算触发（默认关：实测净负 3.2%）
         bustThresholdTokens: 50000 # fresh 超过此值视为「前缀已冷」
+        pruneMinChars: 4000     # 候选下限：摘要本身 ~1k 字符，太小的剪了没收益
         # —— 静态层裁剪臂（工具定义在请求最前端 → 会话中途改动会击穿前缀缓存，
         #    因此只做会话无关的确定性裁剪：同输入必得逐字节同输出）——
-        staticTrimMode: shadow      # 单独控制静态层裁剪臂：先 shadow 观察描述降噪是否会削掉操作性规则
+        staticTrimMode: shadow      # 单独控制静态层裁剪臂：先 shadow，用 `lcm trim-diff` 复核后再切 active
         toolMaxDescriptionChars: 300 # 0=关；300 实测省 54% 描述字符
         dropToolFamilies: []         # 例：["mcp__openviking","mcp__dbx"]（整族不注入）

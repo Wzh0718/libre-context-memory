@@ -1,6 +1,6 @@
 {
   "name": "dsh-lcm",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "libre-context-memory DSH adapter: semantic compression of oversized tool results with spill-handle retrieval (shadow mode by default)",
   "type": "module",
   "main": "src/index.js",

@@ -100,6 +100,6 @@ execFileSync('npm', ['pack', '--pack-destination', DIST], {
   stdio: ['ignore', 'inherit', 'inherit'],
   env: { ...process.env, npm_config_cache: npmCache, npm_config_update_notifier: 'false' },
 })
-const tarball = readdirSync(DIST).find((n) => n.endsWith('.tgz'))
+const tarball = readdirSync(DIST).find((n) => n === `dsh-lcm-${version}.tgz`)
 console.log(`[build] ✅ 产出 ${join(DIST, tarball)}`)
 console.log(`[build] 安装：dsh plugin --profile web add ${join(DIST, tarball)}`)

@@ -5,7 +5,8 @@
  * 用法：node core/cli.mjs <cmd> 或 npm bin 链接后 `lcm <cmd>`。
  */
 
-import { writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
 
 import { compress } from './compress.mjs'
 import { loadConfig } from './config.mjs'
@@ -37,7 +38,7 @@ function parseArgs(argv) {
     const a = argv[i]
     if (a.startsWith('--')) {
       const key = a.slice(2)
-      if (['json', 'no-spill'].includes(key)) args[key] = true
+      if (['json', 'no-spill', 'dry-run'].includes(key)) args[key] = true
       else args[key] = argv[++i]
     } else args._.push(a)
   }
@@ -112,7 +113,7 @@ async function main() {
 
   if (cmd === 'compare') {
     const { compare: runCompare } = await import('./compare.mjs')
-    const c = runCompare(cfg)
+    const c = runCompare(cfg, { project: args.project })
     if (c.requests === 0) { console.log('[lcm] 暂无 usage 计量，无法对比'); return 0 }
     if (args.json) { console.log(JSON.stringify(c, null, 2)); return 0 }
     const n = (x) => Math.round(x).toLocaleString()
@@ -173,13 +174,20 @@ async function main() {
   }
 
   if (cmd === 'report') {
-    const s = meter.summary(cfg)
+    const s = meter.summary(cfg, { project: args.project })
     if (s.events === 0) { console.log('[lcm] 暂无计量事件'); return 0 }
     if (s.usage) {
       const u = s.usage
       console.log(`缓存账本（${u.requests} 个请求）：`)
       console.log(`  命中率 ${(u.hitRate * 100).toFixed(1)}% ｜ fresh 中位 ${u.freshMedian.toLocaleString()} / p90 ${u.freshP90.toLocaleString()} ｜ 击穿苗头 ${u.cacheBusts} 次（fresh>50k）`)
       console.log(`  成本当量 ${Math.round(u.costEquivalent).toLocaleString()}（fresh ${u.totalFresh.toLocaleString()} + 0.1×cached ${u.totalCacheRead.toLocaleString()}）`)
+    }
+    if (s.byProject && s.byProject.length > 1) {
+      console.log(`按项目（${s.byProject.length} 个，--project <名称> 过滤）：`)
+      for (const p of s.byProject) {
+        const name = p.project === '(legacy)' ? '(legacy)' : p.project.split('/').pop()
+        console.log(`  ${name.padEnd(24)} ${String(p.requests).padStart(5)} 请求 ｜ fresh ${p.fresh.toLocaleString()} ｜ 命中 ${(p.cached / Math.max(1, p.fresh + p.cached) * 100).toFixed(1)}% ｜ 击穿 ${p.busts}`)
+      }
     }
     if (s.trims) {
       const saved = s.trimCharsBefore - s.trimCharsAfter
@@ -222,7 +230,114 @@ async function main() {
     return 0
   }
 
-  console.error('用法: lcm <compress|read|recover|report|compare|sweep|stat>')
+  if (cmd === 'trim-diff') {
+    const previewPath = join(cfg.meterDir, 'trim-preview.json')
+    if (!existsSync(previewPath)) {
+      console.error(`[lcm] 未找到复核工件 ${previewPath}`)
+      console.error('     需先在 staticTrimMode: shadow 下跑一次会话（system-prompt/assemble 钩子自动落盘）')
+      return 1
+    }
+    const preview = JSON.parse(readFileSync(previewPath, 'utf8'))
+    if (args.json) { console.log(JSON.stringify(preview, null, 2)); return 0 }
+    const out = []
+    out.push(`静态层裁剪复核（模式 ${preview.mode}，${new Date(preview.savedAt).toLocaleString('sv-SE')}）`)
+    out.push(`工具 ${preview.toolsBefore}→${preview.toolsAfter}，描述字符 ${preview.charsBefore.toLocaleString()}→${preview.charsAfter.toLocaleString()}`
+      + `（省 ${(preview.charsBefore - preview.charsAfter).toLocaleString()}，${((1 - preview.charsAfter / preview.charsBefore) * 100).toFixed(0)}%）`)
+    if (preview.families?.length) out.push(`整族丢弃: ${preview.families.join(', ')}`)
+    out.push('')
+    const trimmed = preview.tools.filter((t) => !t.dropped)
+    const dropped = preview.tools.filter((t) => t.dropped)
+    for (const t of trimmed) {
+      const cut = t.before.length > t.after.length ? t.before.slice(t.after.length) : ''
+      out.push(`■ ${t.name}  ${t.before.length.toLocaleString()}→${t.after.length.toLocaleString()} 字符（裁掉 ${cut.length.toLocaleString()}）`)
+      out.push(`  [保留] ${t.after.replace(/\n/g, '\\n')}`)
+      out.push(`  [裁掉] ${cut.slice(0, 400).replace(/\n/g, '\\n')}${cut.length > 400 ? ` …（共 ${cut.length.toLocaleString()} 字符）` : ''}`)
+      out.push('')
+    }
+    for (const t of dropped) {
+      out.push(`✂ ${t.name}  整族丢弃（原描述 ${t.before.length.toLocaleString()} 字符）`)
+      out.push('')
+    }
+    out.push(`复核通过后：把 cordis.patch.yml 的 staticTrimMode 改为 active（裁剪是确定性的，同输入同输出）。`)
+    const text = out.join('\n')
+    if (args.out) { writeFileSync(args.out, text, 'utf8'); console.error(`[lcm] 已写入 ${args.out}`); return 0 }
+    console.log(text)
+    return 0
+  }
+
+  if (cmd === 'migrate') {
+    // 导入旧版按项目落的 <root>/.lcm/meter*.jsonl 到全局计量根：
+    // 事件补 project 字段（原样保留 ts），写入 meter-000000.jsonl（排序最前的归档段），
+    // 成功后把源文件改名为 *.imported（防重复导入；report/compare 不会再读到它）。
+    const bases = String(args.base ?? cfg.root).split(',').map((s) => s.trim()).filter(Boolean)
+    const dryRun = Boolean(args['dry-run'])
+    const found = []
+    const candidates = [cfg.meterDir]
+    for (const base of bases) {
+      candidates.push(base)
+      try {
+        for (const d1 of readdirSync(base, { withFileTypes: true })) {
+          if (!d1.isDirectory()) continue
+          candidates.push(join(base, d1.name))
+          try {
+            for (const d2 of readdirSync(join(base, d1.name), { withFileTypes: true })) {
+              if (d2.isDirectory()) candidates.push(join(base, d1.name, d2.name))
+            }
+          } catch { /* 深层不可读：跳过 */ }
+        }
+      } catch { /* base 不可读：跳过 */ }
+    }
+    const seen = new Set()
+    for (const dir of candidates) {
+      const lcmDir = dir.endsWith('/.lcm') ? dir : join(dir, '.lcm')
+      if (seen.has(lcmDir)) continue
+      seen.add(lcmDir)
+      if (resolve(lcmDir) === resolve(cfg.meterDir)) continue   // 全局根自身不导入
+      if (!existsSync(lcmDir)) continue
+      for (const name of readdirSync(lcmDir)) {
+        if (/^meter(-\d{6})?\.jsonl$/.test(name)) found.push({ file: join(lcmDir, name), project: dirname(lcmDir) })
+      }
+    }
+    if (found.length === 0) { console.log('[lcm] 未发现可导入的旧计量文件'); return 0 }
+    if (dryRun) {
+      let total = 0
+      for (const { file, project } of found) {
+        const n = readFileSync(file, 'utf8').split('\n').filter((l) => l.trim()).length
+        total += n
+      }
+      console.log(`[lcm] dry-run：共 ${found.length} 个文件 / ${total} 事件，未写入`)
+      return 0
+    }
+    mkdirSync(cfg.meterDir, { recursive: true })
+    const archivePath = join(cfg.meterDir, 'meter-000000.jsonl')
+    let imported = 0
+    let total = 0
+    const failed = []
+    for (const { file, project } of found) {
+      const lines = []
+      let n = 0
+      for (const line of readFileSync(file, 'utf8').split('\n')) {
+        if (!line.trim()) continue
+        try { const e = JSON.parse(line); lines.push(JSON.stringify({ ...e, project: e.project ?? project })); n++ }
+        catch { /* 坏行跳过 */ }
+      }
+      // 先追加后改名（逐文件）：改名失败仅影响该文件，提示人工改名防重复导入
+      appendFileSync(archivePath, lines.join('\n') + '\n', 'utf8')
+      try {
+        renameSync(file, file + '.imported')
+        imported++
+        total += n
+        console.log(`  ${file} → project=${project}（${n} 事件）`)
+      } catch (e) {
+        failed.push(file)
+        console.error(`  ⚠ ${file} 已导入 ${n} 事件，但改名失败（${String(e?.code ?? e?.message)}）——请手动改名防重复导入`)
+      }
+    }
+    console.log(`[lcm] 已导入 ${imported}/${found.length} 个文件 / ${total} 事件 → ${archivePath}（源文件已改名 *.imported）`)
+    return failed.length > 0 ? 1 : 0
+  }
+
+  console.error('用法: lcm <compress|read|recover|report|compare|sweep|stat|trim-diff|migrate>')
   return 2
 }
 

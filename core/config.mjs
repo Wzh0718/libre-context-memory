@@ -2,6 +2,9 @@
  *
  * 优先级：
  * - 项目根：process.env.LCM_ROOT > git root > cwd
+ * - 计量根（meter）：参数 meterRoot > LCM_METER_ROOT > config.json meter.root
+ *   > 全局 ~/.lcm（默认；事件带 project 字段，report/compare 跨项目聚合）。
+ *   旧版按项目落 <root>/.lcm/meter*.jsonl，meterFiles 仍会读回（含 migrate 迁移）。
  * - OpenViking：环境变量 LCM_OPENVIKING_URL + LCM_OPENVIKING_API_KEY，
  *   或 ~/.config/lcm/config.json 中 {"openviking": {...}}
  * - 未配置 OpenViking → spill/记忆降级为项目级本地目录 <root>/.lcm/
@@ -22,7 +25,21 @@ export function findRoot() {
   return process.cwd()
 }
 
-export function loadConfig(root = findRoot()) {
+/** 计量根解析：参数 > 环境变量 > 配置文件 > 全局 ~/.lcm。 */
+export function findMeterRoot(explicit) {
+  if (explicit) return resolve(explicit)
+  if (process.env.LCM_METER_ROOT) return resolve(process.env.LCM_METER_ROOT)
+  const cfgFile = join(homedir(), '.config', 'lcm', 'config.json')
+  if (existsSync(cfgFile)) {
+    try {
+      const data = JSON.parse(readFileSync(cfgFile, 'utf8'))
+      if (typeof data.meter?.root === 'string' && data.meter.root) return resolve(data.meter.root)
+    } catch { /* 配置损坏不致命 */ }
+  }
+  return join(homedir(), '.lcm')
+}
+
+export function loadConfig(root = findRoot(), { meterRoot } = {}) {
   const cfg = {
     root,
     openvikingUrl: process.env.LCM_OPENVIKING_URL || null,
@@ -54,6 +71,9 @@ export function loadConfig(root = findRoot()) {
   cfg.openvikingConfigured = Boolean(cfg.openvikingUrl && cfg.openvikingApiKey)
   cfg.localDir = join(root, '.lcm')
   cfg.spillDir = join(cfg.localDir, 'spill')
-  cfg.meterFile = join(cfg.localDir, 'meter.jsonl')
+  // 计量根：全局统一（默认 ~/.lcm，事件带 project 字段）；<root>/.lcm 作为旧数据源仍可读
+  cfg.meterDir = findMeterRoot(meterRoot)
+  cfg.legacyMeterDir = cfg.localDir
+  cfg.meterFile = join(cfg.meterDir, 'meter.jsonl')
   return cfg
 }

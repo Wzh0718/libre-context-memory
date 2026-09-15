@@ -19,6 +19,10 @@
  *   绝不让成功调用变错误。
  */
 
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { createHash } from 'node:crypto'
+
 import { compress } from '../../../core/compress.mjs'
 import { loadConfig } from '../../../core/config.mjs'
 import * as meter from '../../../core/meter.mjs'
@@ -31,20 +35,22 @@ const DEFAULTS = {
   mode: 'shadow',
   maxInlineChars: 20_000,
   lcmRoot: undefined, // 数据根（.lcm/ 落点）：默认取会话 cwd / 进程 cwd
+  meterRoot: undefined, // 计量根：默认全局 ~/.lcm（事件带 project 字段）；此处可覆盖
   // —— 主动预算剪枝臂 ——
   // 用户拍板：不按单条内容的尺寸/年龄设死规则（第一轮就可能来超大输出，
   // 尺寸/年龄与语义价值无关）。驱动 = 会话总 token 预算；超预算时按
   // 「最大者优先」批量替换，一次击穿办多件事。
   budgetTokens: 100_000,   // 会话总量（tokenMeter）超过此值触发剪枝
   targetTokens: 60_000,    // 剪到此值以下停手（滞回带，避免每轮都剪）
-  pruneMinChars: 2_000,    // 候选下限：比这小的剪了也没收益
+  pruneMinChars: 4_000,    // 候选下限：比这小的剪了也没收益（摘要本身 ~1k 字符）
   // 冷却：一次剪枝会击穿前缀缓存，剪完立刻又剪 = 反复击穿（实测踩到过）。
   // 剪枝后要等会话再长这么多 token 才允许下一次——这是「臂的节流」，
   // 不是对单条内容设尺寸/年龄规则。
   pruneCooldownTokens: 10_000,
   // 剪枝时机：
-  // - piggyback（默认）：只在缓存本来要失效时动手（compaction 事件后 / 观测到击穿后），
-  //   改写历史免费；触发权交给 DSH 内置折叠，避免主动制造昂贵的缓存击穿。
+  // - piggyback（默认）：只在缓存本来要失效时动手（compaction 事件后 / 观测到击穿后 /
+  //   继承会话首请求前），改写历史免费；触发权交给 DSH 内置折叠与必然冷启动，
+  //   避免主动制造昂贵的缓存击穿。
   // - proactive：仍由 budgetTokens 主动触发，只在超长会话显式开（回本需要 ≥104 请求/次，
   //   实测窗口默认开导致净负 3.2%）。
   pruneProactive: false,
@@ -78,19 +84,25 @@ function trimDescription(text, maxChars) {
 
 /**
  * 确定性裁剪工具集：同输入必得同输出（缓存前缀安全的唯一前提）。
- * @returns {{tools: object[], stats: object}}
+ * @returns {{tools: object[], stats: object, pairs: Array<{name: string, before: string, after: string|null}>}}
+ *   pairs 供 trim-diff 复核工件：after=null 表示整族丢弃，before===after 表示未动。
  */
 export function trimTools(tools, cfg) {
   const maxChars = cfg.toolMaxDescriptionChars
   const drop = new Set(cfg.dropToolFamilies ?? [])
   const familiesDropped = new Set()
   const out = []
+  const pairs = []
   let charsBefore = 0
   let charsAfter = 0
   let descTrimmed = 0
   for (const tool of tools) {
     const family = familyOf(tool?.name)
-    if (family !== null && drop.has(family)) { familiesDropped.add(family); continue }
+    if (family !== null && drop.has(family)) {
+      familiesDropped.add(family)
+      pairs.push({ name: tool?.name ?? '?', before: tool?.description ?? '', after: null })
+      continue
+    }
     const desc = typeof tool?.description === 'string' ? tool.description : ''
     charsBefore += [...desc].length
     let next = desc
@@ -100,9 +112,11 @@ export function trimTools(tools, cfg) {
     }
     charsAfter += [...next].length
     out.push(next === desc ? tool : { ...tool, description: next })
+    pairs.push({ name: tool?.name ?? '?', before: desc, after: next })
   }
   return {
     tools: out,
+    pairs,
     stats: {
       toolsBefore: tools.length, toolsAfter: out.length,
       charsBefore, charsAfter, descTrimmed,
@@ -121,6 +135,38 @@ function flattenPlainText(content) {
     text += block.text
   }
   return text
+}
+
+/**
+ * 落 trim-diff 复核工件（<meterRoot>/trim-preview.json）：裁剪前后逐工具对照。
+ * 内容寻址节流：裁剪结果的 digest 没变就不重写。失败静默（复核件绝不影响主流程）。
+ * `lcm trim-diff` CLI 读取此文件渲染给人看——shadow 观察期的人工复核就靠它。
+ */
+export function writeTrimPreview(meterCfg, { trimMode, stats, pairs }) {
+  const previewPath = join(meterCfg.meterDir, 'trim-preview.json')
+  const changed = pairs
+    .filter((p) => p.after === null || p.before !== p.after)
+    .map((p) => ({ name: p.name, dropped: p.after === null, before: p.before, after: p.after ?? '' }))
+  const digest = createHash('sha256')
+    .update(JSON.stringify({ mode: trimMode, changed }))
+    .digest('hex')
+  try {
+    if (existsSync(previewPath)) {
+      try {
+        if (JSON.parse(readFileSync(previewPath, 'utf8'))?.digest === digest) return false
+      } catch { /* 损坏则重写 */ }
+    }
+    writeFileSync(previewPath, JSON.stringify({
+      digest, savedAt: Date.now(), mode: trimMode,
+      toolsBefore: stats.toolsBefore, toolsAfter: stats.toolsAfter,
+      charsBefore: stats.charsBefore, charsAfter: stats.charsAfter,
+      families: stats.families,
+      tools: changed,
+    }))
+    return true
+  } catch {
+    return false
+  }
 }
 
 /** 剪枝兜底：不够压缩阈值的文本做首尾保留（type-agnostic，永不失败）。 */
@@ -161,6 +207,12 @@ export function apply(ctx, config = {}) {
   let warnedNoMeter = false
   const pruneArmedAt = new Map()   // sessionId → 下一次允许剪枝的 token 水位
   const coldSession = new Set()    // 刚发生 compaction/击穿 → 下次 pre-step 可免费改写历史
+  const preStepSeen = new Set()    // 已经历过 pre-step 的会话（继承冷启动窗口只在首个 pre-step 有效）
+  // 计量统一落全局根（默认 ~/.lcm，LCM_METER_ROOT / cordis 配置可覆盖），
+  // 事件带 project 字段（会话 cwd）——此前按会话 cwd + 服务器 cwd 分散落点，
+  // report/compare 只能看到一个项目的零头数据（实测 85% 的事件落在别的根）。
+  // 显式传 root 避免 loadConfig 内部的 git 探测。
+  const meterBase = loadConfig(cfg.lcmRoot ?? process.cwd(), { meterRoot: cfg.meterRoot })
 
   ctx.on('tools/post-execute', async (exec, result, next) => {
     // 先放行下游（hook 等）落定结果；我们只 reshape 被 accept 的纯文本结果。
@@ -185,16 +237,17 @@ export function apply(ctx, config = {}) {
 
       const isShadow = cfg.mode === 'shadow'
       const ref = isShadow ? null : spill.put(lcmCfg, text)
-      meter.record(lcmCfg, {
+      meter.record(meterBase, {
         kind: 'compress', type: r.type,
         originalChars: r.originalChars, compressedChars: [...r.summary].length,
         ratio: Number(r.ratio.toFixed(2)),
         spillId: ref?.spillId ?? null, backend: ref?.backend ?? 'shadow',
         storedBytes: ref?.bytes ?? null, compressed: ref?.compressed ?? null,
         harness: 'dsh', sessionId: sessionId ?? null,
+        project: exec.agent?.session?.header?.cwd ?? null,
       })
       if (ref?.sweep && (ref.sweep.removed > 0 || ref.sweep.reason)) {
-        meter.record(lcmCfg, {
+        meter.record(meterBase, {
           kind: 'spill-sweep', removed: ref.sweep.removed,
           freedBytes: ref.sweep.freedBytes, bytes: ref.sweep.bytes, reason: ref.sweep.reason,
         })
@@ -224,21 +277,24 @@ export function apply(ctx, config = {}) {
   // ---- 静态层裁剪臂（system-prompt/assemble）----
   // 工具定义在请求最前端（ordinal 1–73）→ 会话中途改动会击穿整个前缀缓存。
   // 所以这里只做「会话无关的确定性裁剪」：同输入 → 逐字节相同的输出 → 零额外击穿。
+  // 计量/复核工件一律落 meterBase（全局计量根）——本钩子没有会话上下文，
+  // 此前用 process.cwd() 落点导致事件全部写进服务器 cwd 的 .lcm（实测 bug）。
   ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
     const out = await next()
     try {
       const tools = out?.tools
       if (!Array.isArray(tools) || tools.length === 0) return out
       const trimMode = cfg.staticTrimMode ?? cfg.mode
-      const { tools: trimmed, stats } = trimTools(tools, cfg)
+      const { tools: trimmed, stats, pairs } = trimTools(tools, cfg)
       if (stats.changed === 0) return out
-      const lcmCfg = loadConfig(cfg.lcmRoot ?? process.cwd())
-      meter.record(lcmCfg, {
+      meter.record(meterBase, {
         kind: 'static-trim', mode: trimMode,
         toolsBefore: stats.toolsBefore, toolsAfter: stats.toolsAfter,
         charsBefore: stats.charsBefore, charsAfter: stats.charsAfter,
         descTrimmed: stats.descTrimmed, families: stats.families,
+        project: null,   // 工具集是 profile 级的，不属于任何项目会话
       })
+      writeTrimPreview(meterBase, { trimMode, stats, pairs })
       if (trimMode === 'shadow') {
         ctx.logger.info(
           `dsh-lcm [shadow] static-trim: 工具 ${stats.toolsBefore}→${stats.toolsAfter}，`
@@ -284,6 +340,8 @@ export function apply(ctx, config = {}) {
       const measurement = tokenMeter.measure(session)
       if (!measurement) return next()
       const sessionKey = session.header?.id ?? 'unknown'
+      const firstPreStep = !preStepSeen.has(sessionKey)
+      preStepSeen.add(sessionKey)
       const armedAt = pruneArmedAt.get(sessionKey)
       if (armedAt !== undefined && measurement.totalTokens < armedAt) {
         coldSession.delete(sessionKey) // 冷却中，错过本次免费窗口也不保留
@@ -291,9 +349,15 @@ export function apply(ctx, config = {}) {
       }
 
       const isCold = coldSession.has(sessionKey)
-      // 搭便车：只在缓存本来要失效时才改写历史（compaction 事件后 / 观测到击穿后）
-      // 并设 budgetTokens 守卫：太小的会话不值得一剪
-      const piggybackOk = isCold && measurement.totalTokens > cfg.budgetTokens
+      // 继承冷启动：subagent fork（origin=subagent / parentSession 存在）的转写来自父会话，
+      // 首请求无可命中的缓存（实测 cached≈3k/250k+）→ 首个 pre-step 改写历史免费，
+      // 且直接缩小那个必然全价的请求。该免费窗口只在首个 pre-step 有效。
+      const inherited = session.header?.origin === 'subagent'
+        || typeof session.header?.parentSession === 'string'
+      const inheritedCold = firstPreStep && inherited
+      // 搭便车：只在缓存本来要失效时才改写历史（compaction 事件后 / 观测到击穿后 /
+      // 继承会话首请求前），并设 budgetTokens 守卫：太小的会话不值得一剪
+      const piggybackOk = (isCold || inheritedCold) && measurement.totalTokens > cfg.budgetTokens
       // 主动路径：显式开，且仍要越过预算守卫
       const proactiveOk = cfg.pruneProactive && measurement.totalTokens > cfg.budgetTokens
       if (!piggybackOk && !proactiveOk) {
@@ -362,11 +426,13 @@ export function apply(ctx, config = {}) {
       const after = tokenMeter.measure(session)?.totalTokens ?? (measurement.totalTokens - savedTokens)
       pruneArmedAt.set(sessionKey, after + cfg.pruneCooldownTokens)
       coldSession.delete(sessionKey) // 本次免费/主动窗口已用完
-      meter.record(lcmCfg, {
+      meter.record(meterBase, {
         kind: 'prune', sessionId, mode: cfg.mode,
+        trigger: inheritedCold && !isCold ? 'inherited-cold' : (isCold ? 'cold' : 'proactive'),
         tokensBefore: measurement.totalTokens, budgetTokens: cfg.budgetTokens,
         nodes: picks.length, charsBefore, charsAfter,
         savedTokens, rearmAt: pruneArmedAt.get(sessionKey),
+        project: session.header?.cwd ?? null,
       })
       ctx.logger.info(
         `dsh-lcm ${isShadow ? '[shadow] ' : ''}prune: ${picks.length} 节点 ${charsBefore.toLocaleString()}→${charsAfter.toLocaleString()} 字符`
@@ -381,8 +447,6 @@ export function apply(ctx, config = {}) {
   ctx.on('session/event', (session, event) => {
     try {
       const type = event?.type
-      const lcmRoot = cfg.lcmRoot ?? session?.header?.cwd ?? process.cwd()
-      const lcmCfg = loadConfig(lcmRoot)
       const sessionId = session?.header?.id ?? null
 
       if (type === 'assistant/message' && event?.data?.usage) {
@@ -394,19 +458,21 @@ export function apply(ctx, config = {}) {
         const total = fresh + cacheRead
         // 前缀已冷 = 可以免费改写历史的时机（compaction/击穿）
         if (sessionId && fresh > cfg.bustThresholdTokens) coldSession.add(sessionId)
-        meter.record(lcmCfg, {
+        meter.record(meterBase, {
           kind: 'usage', sessionId,
           input: fresh, cacheRead, fresh,
           hitRate: total > 0 ? Number((cacheRead / total).toFixed(4)) : null,
           output: u.outputTokens ?? null,
           // 击穿苗头：新增很小却大额 fresh（阈值对齐 cfg.bustThresholdTokens）
           cacheBust: fresh > cfg.bustThresholdTokens,
+          project: session?.header?.cwd ?? null,
         })
       } else if (typeof type === 'string' && type.startsWith('compaction/')) {
         coldSession.add(sessionId)
-        meter.record(lcmCfg, {
+        meter.record(meterBase, {
           kind: 'compaction', sessionId, op: type,
           shadowedTokens: event?.data?.shadowedTokenCount ?? null,
+          project: session?.header?.cwd ?? null,
         })
       }
     } catch { /* 观测臂失败静默 */ }

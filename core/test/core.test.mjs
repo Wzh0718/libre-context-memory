@@ -4,7 +4,7 @@
 
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, readdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -15,7 +15,8 @@ import { recoverByHandle, sessionLogFiles } from '../recover.mjs'
 
 function makeCfg(over = {}) {
   const root = mkdtempSync(join(tmpdir(), 'lcm-core-'))
-  return { ...loadConfig(root), ...over }
+  // meterRoot 固定在临时目录内：测试绝不读写真实 ~/.lcm（全局计量根）
+  return { ...loadConfig(root, { meterRoot: join(root, '.lcm') }), ...over }
 }
 
 const BIG_TEXT = ('2026-09-11T01:00:00Z INFO worker processing item\n').repeat(2_000)
@@ -104,6 +105,45 @@ test('meter：按月轮转 + 汇总读取多文件（兼容旧单文件）', () 
   const s = meter.summary(cfg)
   assert.equal(s.usage.requests, 2, '轮转文件 + 旧单文件都要计入')
   assert.equal(s.files.length, 2)
+})
+
+test('meter：全局根 + 项目根合并读取（legacyMeterDir 兼容历史落点）', () => {
+  const root = mkdtempSync(join(tmpdir(), 'lcm-meter-merge-'))
+  // 全局根与项目根各有一个文件 → 都要被读到
+  const cfg = { ...loadConfig(root, { meterRoot: join(root, 'global') }) }
+  mkdirSync(join(root, 'global'), { recursive: true })
+  writeFileSync(join(root, 'global', 'meter-202609.jsonl'),
+    JSON.stringify({ ts: 2, kind: 'usage', fresh: 100, cacheRead: 900, project: '/p/global' }) + '\n')
+  mkdirSync(join(root, '.lcm'), { recursive: true })
+  writeFileSync(join(root, '.lcm', 'meter.jsonl'),
+    JSON.stringify({ ts: 1, kind: 'usage', fresh: 50, cacheRead: 950 }) + '\n')
+  const s = meter.summary(cfg)
+  assert.equal(s.usage.requests, 2, '全局根 + 项目 legacy 根都要计入')
+  assert.equal(s.files.length, 2)
+})
+
+test('meter：旧口径 fresh=0/input=N 归一化 + 按项目分组与过滤', () => {
+  const cfg = makeCfg()
+  mkdirSync(cfg.meterDir, { recursive: true })
+  writeFileSync(cfg.meterFile, [
+    JSON.stringify({ ts: 1, kind: 'usage', input: 3075, cacheRead: 113152, fresh: 0, project: '/home/libre/project/a' }),
+    JSON.stringify({ ts: 2, kind: 'usage', fresh: 500, cacheRead: 1000, project: '/home/libre/project/b' }),
+    JSON.stringify({ ts: 3, kind: 'usage', fresh: 0, input: 0, cacheRead: 500, project: '/home/libre/project/b' }),
+  ].join('\n') + '\n')
+  const s = meter.summary(cfg)
+  assert.equal(s.usage.totalFresh, 3_575, '旧行 fresh=0 用 input 归一；真 0 保持 0')
+  assert.equal(s.byProject.length, 2)
+  const sa = meter.summary(cfg, { project: 'a' })   // basename 匹配
+  assert.equal(sa.usage.requests, 1)
+  assert.equal(sa.usage.totalFresh, 3_075)
+  const sb = meter.summary(cfg, { project: '/home/libre/project/b' })  // 全路径匹配
+  assert.equal(sb.usage.requests, 2)
+  // compare 侧同样归一
+  ;(async () => {
+    const { compare } = await import('../compare.mjs')
+    const c = compare(cfg)
+    assert.equal(c.actual.fresh, 3_575)
+  })()
 })
 
 test('compare：反事实对比与击穿归因（只在真剪枝/真压缩时计入治理量）', async () => {

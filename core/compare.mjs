@@ -13,14 +13,14 @@
  *   （相对缓存价多付的部分）。
  */
 
-import { meterFiles } from './meter.mjs'
+import { meterFiles, freshOf } from './meter.mjs'
 import { readFileSync } from 'node:fs'
 
 export const CHARS_PER_TOKEN = 2
 export const CACHED_PRICE = 0.1
 
-/** 读取全部计量事件并按时间排序（多个轮转文件合并）。 */
-export function loadEvents(cfg) {
+/** 读取全部计量事件并按时间排序（多个轮转文件合并；usage 事件归一化 fresh）。 */
+export function loadEvents(cfg, { project } = {}) {
   const events = []
   for (const file of meterFiles(cfg)) {
     for (const line of readFileSync(file, 'utf8').split('\n')) {
@@ -28,7 +28,13 @@ export function loadEvents(cfg) {
       try { events.push(JSON.parse(line)) } catch { /* 坏行跳过 */ }
     }
   }
-  return events.sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0))
+  const filtered = project
+    ? events.filter((e) => e.project === project || (typeof e.project === 'string' && e.project.endsWith('/' + project)))
+    : events
+  for (const e of filtered) {
+    if (e.kind === 'usage') e.fresh = freshOf(e)   // 旧口径 fresh=0/input=N 归一
+  }
+  return filtered.sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0))
 }
 
 /** 事件是否代表「真的动了上下文」（shadow 只记账，不算治理量）。 */
@@ -49,8 +55,8 @@ function trimmedCharsOf(event) {
  * 对比分析。
  * @returns 结构化结果：窗口/分组统计/反事实对比/击穿成本/净收益
  */
-export function compare(cfg, { bustThresholdTokens = 50_000 } = {}) {
-  const events = loadEvents(cfg)
+export function compare(cfg, { bustThresholdTokens = 50_000, project } = {}) {
+  const events = loadEvents(cfg, { project })
   const usage = events.filter((e) => e.kind === 'usage')
   if (usage.length === 0) return { requests: 0 }
 

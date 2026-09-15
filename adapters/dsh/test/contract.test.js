@@ -2,11 +2,35 @@
 
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, readdirSync, readFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, existsSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { apply } from '../src/index.js'
+import { loadConfig as loadConfigRaw } from '../../../core/config.mjs'
+import { read as spillRead, usage as spillUsage } from '../../../core/spill.mjs'
+import { meterFiles, summary } from '../../../core/meter.mjs'
+
+/** meter 根隔离：测试内计量一律落临时目录（真实全局根是 ~/.lcm，绝不能碰）。 */
+const lcfg = (root) => loadConfigRaw(root, { meterRoot: join(root, '.lcm') })
+function applyT(ctx, opts = {}) {
+  const root = opts.lcmRoot
+  return apply(ctx, root ? { ...opts, meterRoot: join(root, '.lcm') } : opts)
+}
+
+/** 读 meter 文件里指定 kind 的原始事件（summary 不透出的字段用这个查）。 */
+function readMeterEvents(root, kind) {
+  const dir = join(root, '.lcm')
+  const out = []
+  for (const name of readdirSync(dir)) {
+    if (!/^meter(-\d{6})?\.jsonl$/.test(name)) continue
+    for (const line of readFileSync(join(dir, name), 'utf8').split('\n')) {
+      if (!line) continue
+      try { const e = JSON.parse(line); if (e.kind === kind) out.push(e) } catch { /* skip */ }
+    }
+  }
+  return out
+}
 
 function fakeCtx() {
   const listeners = []
@@ -94,14 +118,14 @@ const bigLog = () => Array.from({ length: 3000 }, (_, i) =>
 
 test('小输出直通：不触发压缩', async () => {
   const ctx = fakeCtx()
-  apply(ctx, { mode: 'active' })
+  applyT(ctx, { mode: 'active' })
   const d = await runPostExecute(ctx, fakeExec(), acceptDecision('小结果'))
   assert.equal(d.content[0].text, '小结果')
 })
 
 test('非 accept / read / 子调用：全部透传', async () => {
   const ctx = fakeCtx()
-  apply(ctx, { mode: 'active' })
+  applyT(ctx, { mode: 'active' })
   const big = 'x'.repeat(50_000)
   assert.equal((await runPostExecute(ctx, fakeExec(), { kind: 'block', feedback: 'no' })).kind, 'block')
   const d = acceptDecision(big)
@@ -112,22 +136,20 @@ test('非 accept / read / 子调用：全部透传', async () => {
 test('shadow 模式：记录决策但不替换', async () => {
   const ctx = fakeCtx()
   const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-shadow-'))
-  apply(ctx, { mode: 'shadow', lcmRoot })
+  applyT(ctx, { mode: 'shadow', lcmRoot })
   const text = bigLog()
   const d = await runPostExecute(ctx, fakeExec(), acceptDecision(text))
   assert.equal(d.content[0].text, text)  // 原文透传
   assert.ok(ctx.logs.info.some((m) => m.includes('[shadow]')), '应有 shadow 日志')
   // shadow 记了 meter 但不落 spill
-  const { meterFiles } = await import('../../../core/meter.mjs')
-  const { loadConfig: lc } = await import('../../../core/config.mjs')
-  assert.ok(meterFiles(lc(lcmRoot)).length > 0, 'meter 应有记录（按月轮转文件）')
+  assert.ok(meterFiles(lcfg(lcmRoot)).length > 0, 'meter 应有记录（按月轮转文件）')
   assert.ok(!existsSync(join(lcmRoot, '.lcm', 'spill')), 'shadow 不落 spill')
 })
 
 test('active 模式：替换为摘要+句柄，句柄可回取', async () => {
   const ctx = fakeCtx()
   const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-active-'))
-  apply(ctx, { mode: 'active', lcmRoot })
+  applyT(ctx, { mode: 'active', lcmRoot })
   const text = bigLog()
   const d = await runPostExecute(ctx, fakeExec(), acceptDecision(text))
   const replaced = d.content[0].text
@@ -138,10 +160,8 @@ test('active 模式：替换为摘要+句柄，句柄可回取', async () => {
   const spillDir = join(lcmRoot, '.lcm', 'spill')
   const files = readdirSync(spillDir)
   assert.equal(files.length, 1)
-  const { read } = await import('../../../core/spill.mjs')
-  const { loadConfig } = await import('../../../core/config.mjs')
   const handle = replaced.match(/spill:[0-9a-f]{12}/)[0]      // 用模型实际拿到的句柄回取
-  assert.equal(read(loadConfig(lcmRoot), handle).text, text)
+  assert.equal(spillRead(lcfg(lcmRoot), handle).text, text)
 })
 
 test('active 模式失败静默：核心抛错时透传原文', async () => {
@@ -150,7 +170,7 @@ test('active 模式失败静默：核心抛错时透传原文', async () => {
   const fileAsRoot = join(tmpdir(), `lcm-notdir-${process.pid}`)
   const { writeFileSync } = await import('node:fs')
   writeFileSync(fileAsRoot, 'x')
-  apply(ctx, { mode: 'active', lcmRoot: fileAsRoot })
+  applyT(ctx, { mode: 'active', lcmRoot: fileAsRoot })
   const big = 'y'.repeat(50_000)
   const d = await runPostExecute(ctx, fakeExec(), acceptDecision(big))
   assert.equal(d.content[0].text, big)
@@ -160,7 +180,7 @@ test('active 模式失败静默：核心抛错时透传原文', async () => {
 test('观测臂：每请求 usage 与折叠事件落 meter（不改行为）', async () => {
   const ctx = fakeCtx()
   const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-usage-'))
-  apply(ctx, { mode: 'shadow', lcmRoot })
+  applyT(ctx, { mode: 'shadow', lcmRoot })
   const { fn } = ctx.listeners.find((l) => l.event === 'session/event')
   const session = { header: { id: 'sess-u', cwd: lcmRoot } }
   // DSH 口径：inputTokens = fresh（不含 cacheRead）
@@ -169,9 +189,7 @@ test('观测臂：每请求 usage 与折叠事件落 meter（不改行为）', a
   fn(session, { type: 'compaction/prune', data: { shadowedTokenCount: 3383 } })
   fn(session, { type: 'session/other', data: {} })  // 无关事件忽略
 
-  const { summary } = await import('../../../core/meter.mjs')
-  const { loadConfig } = await import('../../../core/config.mjs')
-  const s = summary(loadConfig(lcmRoot))
+  const s = summary(lcfg(lcmRoot))
   assert.equal(s.usage.requests, 2)
   assert.ok(Math.abs(s.usage.hitRate - 94_000 / 160_000) < 1e-3)   // (6k fresh + 94k cached + 60k fresh)
   assert.equal(s.usage.totalFresh, 66_000)
@@ -182,7 +200,7 @@ test('观测臂：每请求 usage 与折叠事件落 meter（不改行为）', a
 test('剪枝臂：预算内不动', async () => {
   const ctx = fakeCtx()
   const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-prune-'))
-  apply(ctx, { mode: 'active', lcmRoot })
+  applyT(ctx, { mode: 'active', lcmRoot })
   withTokenMeter(ctx, 50_000)  // < budgetTokens 100k
   const session = fakeSession(lcmRoot, [toolResultEvent('x'.repeat(80_000))])
   await runPreStep(ctx, session)
@@ -192,15 +210,13 @@ test('剪枝臂：预算内不动', async () => {
 test('剪枝臂 shadow：超预算完整计算+记账，但不改写历史', async () => {
   const ctx = fakeCtx()
   const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-prune-'))
-  apply(ctx, { mode: 'shadow', lcmRoot })
+  applyT(ctx, { mode: 'shadow', lcmRoot })
   withTokenMeter(ctx, 150_000)
   const session = fakeSession(lcmRoot, [toolResultEvent('x'.repeat(80_000)), toolResultEvent('y'.repeat(80_000))])
   emitSessionEvent(ctx, session, { type: 'compaction/basic' })
   await runPreStep(ctx, session)
   assert.equal(session.appends.length, 0)  // 影子不改写
-  const { summary } = await import('../../../core/meter.mjs')
-  const { loadConfig } = await import('../../../core/config.mjs')
-  const s = summary(loadConfig(lcmRoot))
+  const s = summary(lcfg(lcmRoot))
   assert.equal(s.prunes, 1)
   assert.equal(s.pruneShadow, 1)
   assert.equal(s.pruneNodes, 1)            // 最大者优先 + 最新保留 → 只剪 seq1
@@ -209,7 +225,7 @@ test('剪枝臂 shadow：超预算完整计算+记账，但不改写历史', asy
 test('剪枝臂 active：shadow-price + replace 成对落地，最新节点跳过', async () => {
   const ctx = fakeCtx()
   const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-prune-'))
-  apply(ctx, { mode: 'active', lcmRoot })
+  applyT(ctx, { mode: 'active', lcmRoot })
   withTokenMeter(ctx, 150_000)
   const session = fakeSession(lcmRoot, [
     toolResultEvent('a'.repeat(80_000)),   // seq1 最老最大 → 被剪
@@ -249,13 +265,11 @@ async function runAssemble(ctx, assembly) {
 test('静态层裁剪 shadow：只记账，工具集原样返回', async () => {
   const ctx = fakeCtx()
   const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-trim-'))
-  apply(ctx, { mode: 'shadow', lcmRoot, toolMaxDescriptionChars: 200 })
+  applyT(ctx, { mode: 'shadow', lcmRoot, toolMaxDescriptionChars: 200 })
   const asm = fakeAssembly()
   const out = await runAssemble(ctx, asm)
   assert.equal(out, asm)                                   // 影子严格不改写
-  const { summary } = await import('../../../core/meter.mjs')
-  const { loadConfig } = await import('../../../core/config.mjs')
-  const s = summary(loadConfig(lcmRoot))
+  const s = summary(lcfg(lcmRoot))
   assert.equal(s.trims, 1)
   assert.equal(s.trimToolsBefore, 4)
   assert.ok(s.trimCharsAfter < s.trimCharsBefore)
@@ -264,7 +278,7 @@ test('静态层裁剪 shadow：只记账，工具集原样返回', async () => {
 test('静态层裁剪 active：描述压到预算内 + 整族丢弃，且逐字节确定', async () => {
   const ctx = fakeCtx()
   const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-trim-'))
-  apply(ctx, { mode: 'active', lcmRoot, toolMaxDescriptionChars: 200, dropToolFamilies: ['mcp__mnemon'] })
+  applyT(ctx, { mode: 'active', lcmRoot, toolMaxDescriptionChars: 200, dropToolFamilies: ['mcp__mnemon'] })
   const out1 = await runAssemble(ctx, fakeAssembly())
   const out2 = await runAssemble(ctx, fakeAssembly())
   assert.deepEqual(out1, out2)                              // 确定性 = 缓存前缀安全
@@ -282,7 +296,7 @@ test('静态层裁剪 active：描述压到预算内 + 整族丢弃，且逐字�
 test('剪枝臂 active：介于压缩直通区（2k–20k）的节点也必须变小', async () => {
   const ctx = fakeCtx()
   const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-prune-mid-'))
-  apply(ctx, { mode: 'active', lcmRoot })
+  applyT(ctx, { mode: 'active', lcmRoot })
   withTokenMeter(ctx, 150_000)
   const mid = ('INFO worker heartbeat line with some payload\n').repeat(120)   // ≈5k 字符
   assert.ok([...mid].length > 2_000 && [...mid].length < 20_000)
@@ -300,13 +314,11 @@ test('剪枝臂 active：介于压缩直通区（2k–20k）的节点也必须�
 test('分臂模式：mode=active 时静态层裁剪仍可单独保持 shadow', async () => {
   const ctx = fakeCtx()
   const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-trim-scope-'))
-  apply(ctx, { mode: 'active', staticTrimMode: 'shadow', lcmRoot, toolMaxDescriptionChars: 100 })
+  applyT(ctx, { mode: 'active', staticTrimMode: 'shadow', lcmRoot, toolMaxDescriptionChars: 100 })
   const asm = fakeAssembly()
   const out = await runAssemble(ctx, asm)
   assert.equal(out, asm, '静态层裁剪臂保持 shadow → 工具集必须原样返回')
-  const { summary } = await import('../../../core/meter.mjs')
-  const { loadConfig } = await import('../../../core/config.mjs')
-  const s = summary(loadConfig(lcmRoot))
+  const s = summary(lcfg(lcmRoot))
   assert.equal(s.trims, 1)
   assert.equal(s.trimShadow, 1, '计量里应标为 shadow')
 })
@@ -314,7 +326,7 @@ test('分臂模式：mode=active 时静态层裁剪仍可单独保持 shadow', a
 test('剪枝冷却：剪过一次后要等会话再长够 token 才允许再剪（防反复击穿）', async () => {
   const ctx = fakeCtx()
   const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-cooldown-'))
-  apply(ctx, { mode: 'active', lcmRoot, budgetTokens: 100_000, targetTokens: 60_000, pruneCooldownTokens: 10_000 })
+  applyT(ctx, { mode: 'active', lcmRoot, budgetTokens: 100_000, targetTokens: 60_000, pruneCooldownTokens: 10_000 })
   const { fn } = ctx.listeners.find((l) => l.event === 'agent/pre-step')
   const entries = [toolResultEvent('a'.repeat(40_000)), toolResultEvent('b'.repeat(40_000)), toolResultEvent('c'.repeat(40_000))]
   const session = fakeSession(lcmRoot, entries)
@@ -359,7 +371,7 @@ test('剪枝冷却：剪过一次后要等会话再长够 token 才允许再剪�
 test('piggyback：没有免费窗口时，即使超预算也不主动制造击穿', async () => {
   const ctx = fakeCtx()
   const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-piggyback-'))
-  apply(ctx, { mode: 'active', lcmRoot, budgetTokens: 100_000 })
+  applyT(ctx, { mode: 'active', lcmRoot, budgetTokens: 100_000 })
   withTokenMeter(ctx, 150_000)
   const session = fakeSession(lcmRoot, [toolResultEvent('a'.repeat(80_000)), toolResultEvent('b'.repeat(80_000))])
   await runPreStep(ctx, session)
@@ -369,7 +381,7 @@ test('piggyback：没有免费窗口时，即使超预算也不主动制造击�
 test('piggyback：compaction 事件后但低于 budgetTokens 守卫 → 不剪，且 cold 标记被消费', async () => {
   const ctx = fakeCtx()
   const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-piggyback-guard-'))
-  apply(ctx, { mode: 'active', lcmRoot, budgetTokens: 100_000 })
+  applyT(ctx, { mode: 'active', lcmRoot, budgetTokens: 100_000 })
   withTokenMeter(ctx, 80_000) // 低于 budget
   const session = fakeSession(lcmRoot, [toolResultEvent('a'.repeat(40_000))])
   emitSessionEvent(ctx, session, { type: 'compaction/basic' })
@@ -384,7 +396,7 @@ test('piggyback：compaction 事件后但低于 budgetTokens 守卫 → 不剪�
 test('piggyback：观测到击穿后下一次 pre-step 可免费剪枝', async () => {
   const ctx = fakeCtx()
   const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-piggyback-bust-'))
-  apply(ctx, { mode: 'active', lcmRoot, budgetTokens: 100_000, bustThresholdTokens: 50_000 })
+  applyT(ctx, { mode: 'active', lcmRoot, budgetTokens: 100_000, bustThresholdTokens: 50_000 })
   withTokenMeter(ctx, 150_000)
   const session = fakeSession(lcmRoot, [toolResultEvent('a'.repeat(80_000)), toolResultEvent('b'.repeat(80_000))])
   // 模拟一次击穿：usage.fresh > 阈值（前缀已冷）
@@ -399,7 +411,7 @@ test('piggyback：观测到击穿后下一次 pre-step 可免费剪枝', async (
 test('proactive=true 时仍可按原主动预算路径触发', async () => {
   const ctx = fakeCtx()
   const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-proactive-'))
-  apply(ctx, { mode: 'active', lcmRoot, budgetTokens: 100_000, pruneProactive: true })
+  applyT(ctx, { mode: 'active', lcmRoot, budgetTokens: 100_000, pruneProactive: true })
   withTokenMeter(ctx, 150_000)
   const session = fakeSession(lcmRoot, [toolResultEvent('a'.repeat(80_000)), toolResultEvent('b'.repeat(80_000))])
   await runPreStep(ctx, session)
@@ -408,4 +420,66 @@ test('proactive=true 时仍可按原主动预算路径触发', async () => {
 
 test('非法 mode 在加载期拒绝', () => {
   assert.throws(() => apply(fakeCtx(), { mode: 'bogus' }), /mode must be/)
+})
+
+test('继承冷启动：subagent fork 首个 pre-step 免费剪枝（无需 compaction/击穿事件）', async () => {
+  const ctx = fakeCtx()
+  const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-inherit-'))
+  applyT(ctx, { mode: 'active', lcmRoot })
+  withTokenMeter(ctx, 150_000)
+  const session = fakeSession(lcmRoot, [toolResultEvent('a'.repeat(80_000)), toolResultEvent('b'.repeat(80_000))])
+  session.header = { ...session.header, origin: 'subagent', parentSession: 'session-parent' }
+  await runPreStep(ctx, session)
+  assert.ok(session.appends.length > 0, 'fork 首请求前应免费剪枝（继承转写无缓存可打穿）')
+  const prunes = readMeterEvents(lcmRoot, 'prune')
+  assert.equal(prunes.length, 1)
+  assert.equal(prunes[0].trigger, 'inherited-cold')
+  assert.equal(prunes[0].project, lcmRoot, '剪枝事件应带 project 标签')
+  // 第二个 pre-step：继承窗口只在首个 pre-step 有效 → 冷却水位内不得再剪
+  const before = session.appends.length
+  await runPreStep(ctx, session)
+  assert.equal(session.appends.length, before, '继承窗口一次性，不得重复触发')
+})
+
+test('继承冷启动守卫：普通会话（非 fork）首个 pre-step 不得凭空剪枝', async () => {
+  const ctx = fakeCtx()
+  const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-inherit-guard-'))
+  applyT(ctx, { mode: 'active', lcmRoot })
+  withTokenMeter(ctx, 150_000)
+  const session = fakeSession(lcmRoot, [toolResultEvent('a'.repeat(80_000))])
+  session.header = { ...session.header }   // 无 origin / parentSession
+  await runPreStep(ctx, session)
+  assert.equal(session.appends.length, 0, '普通新会话首请求可能命中缓存，不得凭空改写历史')
+})
+
+test('继承冷启动守卫：fork 但低于 budgetTokens 也不剪', async () => {
+  const ctx = fakeCtx()
+  const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-inherit-budget-'))
+  applyT(ctx, { mode: 'active', lcmRoot })
+  withTokenMeter(ctx, 50_000)   // < budgetTokens 100k
+  const session = fakeSession(lcmRoot, [toolResultEvent('a'.repeat(80_000))])
+  session.header = { ...session.header, origin: 'subagent', parentSession: 'session-parent' }
+  await runPreStep(ctx, session)
+  assert.equal(session.appends.length, 0, '低于守卫水位的小 fork 不值得一剪')
+})
+
+test('trim-diff 复核工件：assemble 自动落盘 + 内容寻址节流', async () => {
+  const ctx = fakeCtx()
+  const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-trimpv-'))
+  applyT(ctx, { mode: 'shadow', lcmRoot, toolMaxDescriptionChars: 100 })
+  await runAssemble(ctx, fakeAssembly())
+  const pv = join(lcmRoot, '.lcm', 'trim-preview.json')
+  assert.ok(existsSync(pv), '复核工件应落在 meter 根')
+  const data = JSON.parse(readFileSync(pv, 'utf8'))
+  assert.ok(data.tools.length > 0, '只记录被改动的工具')
+  assert.ok(data.tools.every((t) => typeof t.before === 'string' && typeof t.after === 'string'))
+  assert.ok(data.charsBefore > data.charsAfter)
+  // 同输入再跑：digest 不变 → 不重写（savedAt 不变）
+  await runAssemble(ctx, fakeAssembly())
+  const again = JSON.parse(readFileSync(pv, 'utf8'))
+  assert.equal(again.savedAt, data.savedAt, '同输入不得重写复核工件')
+  // 静态层计量事件带 project: null 且落 meter 根（此前落错根的修复）
+  const trims = readMeterEvents(lcmRoot, 'static-trim')
+  assert.equal(trims.length, 2)   // 两次 assemble 各记一次
+  assert.equal(trims[0].project, null)
 })
