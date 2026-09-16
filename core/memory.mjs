@@ -66,6 +66,43 @@ export function forbiddenReason(claim) {
   return null
 }
 
+/**
+ * 元叙述/过程性噪声过滤：assistant 的行为宣告、对话管理语句、规划建议不是记忆。
+ * 实测依据（extract-bench，6 真实会话/1106 轮）：低信号碎片 22.6%，入库样例可见
+ * 「接下来如果你想动手，我建议的顺序是…」以 0.65 分入库为 decision。
+ * 设计纪律：不按分数门槛过滤——「结论：架构必须是核心引擎+薄适配层」这类好条目
+ * 也是低信号；必须按语义形态过滤。全部确定性、零 LLM。
+ * 返回原因字符串；非噪声返回 null。
+ */
+export function narrativeNoiseReason(body, { role = null } = {}) {
+  const s = String(body ?? '').trim()
+  if (!s) return null
+  // 目录树行：脱离目录语境无意义（│ ├ └ 开头）
+  if (/^[│├└+\\|]/.test(s)) return 'tree-line'
+  // ── assistant 专属形态（用户轮次的同形文本是指令/决策，必须保留）──
+  if (role === 'assistant') {
+    // 选项菜单：「A. 先切 active（1 分钟）：…」——assistant 给用户的行动菜单。
+    // 容忍 markdown 装饰前缀：真实样本是「**A. 先切 active（1 分钟）**：…」（加粗 menu）
+    if (/^[\s*#>_`]*[A-Z]\.\s/.test(s)) return 'option-menu'
+    // 你-向建议：「或者你现在重启一次 DSH…」「你可以直接改…」——对用户的行动建议，非沉淀事实
+    if (/^(或者)?(你|您)(现在)?(可以|需要|应该|重启|只要|直接|帮我)/.test(s)) return 'user-directed-advice'
+    // 要我-offer：「要我改 cordis.patch.yml 吗」——assistant 的行动要约（句首/句中）
+    if (/(^|[。，；])\s*要我(改|做|跑|开|关|加|删|把)/.test(s)) return 'self-offer'
+  }
+  // 行为宣告（句首）：我先核实/我顺手/数据核实完了/一句话总结…
+  if (/^(我先|我顺手|我这就|我接下来|接下来我|我会先|顺手|数据核实完了|核实完了|一句话总结|逻辑看着)/.test(s)) return 'narrative-action'
+  // 行为宣告（句中）："。我先确认并细化" 之类——宣告动作的语句整体是过程叙述
+  if (/我(先|这就|将)(去|来)?(快速|顺手)?(核实|确认|记录|检查|纠正|细化|插桩|总结|回答|开工|动手)/.test(s)) return 'narrative-action'
+  // 规划建议：下一步建议/我建议的顺序/接下来如果你想动手…（assistant 给用户的行动建议，非沉淀事实）
+  if (/^(下一步建议|我建议的顺序|我都可以直接开工|建议二选一|接下来如果你)/.test(s)) return 'planning-advice'
+  // 对话尾巴：以「你能理解吗/对吧/是吧」收尾——对话管理语句
+  if (/(你能理解吗|你说是吧|对吧|是吧)[？?]?$/.test(s)) return 'conversation-tail'
+  // 短冒号/破折号尾：引出下文的行，内容不完整（"用 analyze.py 对比："）。
+  // 豁免：含枚举括号的决定列表以冒号引出很常见（"三个决定（不走 axon、…），我都落进了文档："）
+  if (/[：:—–]\s*$/.test(s) && [...s].length < 80 && !/[（(「][^）)」]*[、,，/][^）)」]*[）)」]/.test(s)) return 'dangling'
+  return null
+}
+
 // ---------------------------------------------------------------- 存储
 
 function storePath(cfg) { return join(cfg.memoryDir, 'memories.jsonl') }
@@ -670,7 +707,7 @@ export function qualityScore(c) {
  * 无锚点不再截断 claim 当 subject（零信息且检索重复计权）、每候选带质量分。
  * @returns Array<{type, subject, claim, keywords, evidence, score}>
  */
-export function extractCandidates(text) {
+export function extractCandidates(text, { role = null } = {}) {
   const src = String(text ?? '')
   if (!src) return []
   const lines = src.split('\n')
@@ -687,7 +724,7 @@ export function extractCandidates(text) {
     if (!isListItem && line.length > 240) continue   // 只要列表项（摘要形态）或短行
     const body = line.replace(/^[-*•]\s+/, '').replace(/^>\s?/, '').trim()   // 清引用块标记
     if (!body) continue
-    const type = classify(body, section)
+    const type = classify(body, section, role)
     if (type === null) continue
     const claim = body.slice(0, 400)
     const key = claim.toLowerCase().replace(/\s+/g, '')
@@ -708,8 +745,9 @@ export function extractCandidates(text) {
   return candidates
 }
 
-function classify(body, section) {
+function classify(body, section, role) {
   if (forbiddenReason(body)) return null
+  if (narrativeNoiseReason(body, { role })) return null   // 元叙述/过程性噪声（行为宣告/对话管理/目录树行/冒号尾碎片/assistant 建议）
   if (/intent|目标|请求与意图/.test(section) || THREAD_RE.test(body)) return 'open_thread'
   if (DECISION_RE.test(body)) return 'decision'
   if (CONCLUSION_RE.test(body)) return 'conclusion'

@@ -29,7 +29,7 @@ for (const log of sessionLogFiles(sessionsDir, limit)) {
   const logPath = typeof log === 'string' ? log : log.path
   const sessionId = logPath.split('/').at(-2)
   const project = logPath.split('/').at(-3)?.replace(/^--+|--+$/g, '') ?? null
-  const userTurns = userTalksOf(logPath)
+  const userTurns = userTalksOf(logPath).map((t) => ({ text: t, role: 'user' }))
   const assistantTurns = []
   const text = readSessionLog(logPath)
   for (const line of text.split('\n')) {
@@ -37,14 +37,14 @@ for (const log of sessionLogFiles(sessionsDir, limit)) {
     let ev; try { ev = JSON.parse(line) } catch { continue }
     if (ev.type !== 'assistant/message') continue
     const t = (ev.data?.message?.content ?? []).filter((b) => b?.type === 'text').map((b) => b.text).join('\n').trim()
-    if (t) assistantTurns.push(t)
+    if (t) assistantTurns.push({ text: t, role: 'assistant' })
   }
   const all = [...userTurns, ...assistantTurns]
   if (all.length === 0) continue
   sessions++
-  for (const t of all) {
+  for (const { text: t, role } of all) {
     turns++
-    for (const c of memory.extractCandidates(t)) {
+    for (const c of memory.extractCandidates(t, { role })) {
       candidates++
       const r = memory.record(cfg, { ...c, source: 'incremental', sessionId, project })
       if (r.action === 'ADD' || r.action === 'UPDATE') added++

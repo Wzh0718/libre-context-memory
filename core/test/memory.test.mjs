@@ -612,3 +612,106 @@ test('注入隔离：searchDetailed 报告被排除的外项目条目数（可�
   assert.equal(d.project, '/home/libre/project/libre_quant')
   assert.equal(d.projectScope, 'same')
 })
+
+// ─────────────────────────── 提取器元叙述噪声过滤 ───────────────────────────
+// 实测：extract-bench 低信号碎片 22.6%，入库样例里可见 assistant 行为宣告/规划建议
+// （"接下来如果你想动手，我建议的顺序是…" 以 0.65 分入库为 decision）。
+// 设计纪律：不按分数门槛过滤（"结论：架构必须是核心引擎+薄适配层"这类好条目也是低信号），
+// 按语义形态过滤（行为宣告/对话管理/目录树行/短冒号尾碎片）。
+
+test('元叙述过滤：行为宣告不是记忆', () => {
+  for (const bad of [
+    '我先快速核实一下 DSH 的压缩实测数据，再回答「重复写」的问题。',
+    '数据核实完了，你的修正是对的，我先把实测纠正，再回答「重复写」。',
+    '顺手把历史里的大输出批量替换成「摘要+句柄」，之后所有轮都受益',
+    '一句话总结你的疑问：这个项目对缩减 tokens 的定义是三条路径',
+    '理解，这是把 spill 存储也纳入「可选后端」的设计。我先确认并细化这个设计，记入 memory，然后',
+  ]) assert.equal(memory.narrativeNoiseReason(bad) !== null, true, `应判噪声：${bad.slice(0, 30)}`)
+})
+
+test('元叙述过滤：规划建议/对话尾巴不是记忆', () => {
+  for (const bad of [
+    '下一步建议二选一，我都可以直接开工：',
+    '接下来如果你想动手，我建议的顺序是：先确认 DSH 是否走 axon，然后起评测',
+    '这个方案就这样定了，你能理解吗？',
+  ]) assert.equal(memory.narrativeNoiseReason(bad) !== null, true, `应判噪声：${bad.slice(0, 30)}`)
+})
+
+test('元叙述过滤：目录树行不是记忆', () => {
+  assert.equal(memory.narrativeNoiseReason('│   ├── spill.mjs          # 内容寻址 spill，本地后端 + viking 预留'), 'tree-line')
+  assert.equal(memory.narrativeNoiseReason('├── meter.mjs          # JSONL 计量'), 'tree-line')
+})
+
+test('元叙述过滤：短冒号尾碎片不是记忆（引出下文的行，内容不完整）', () => {
+  assert.equal(memory.narrativeNoiseReason('直接在臂里插桩定位：'), 'dangling')
+  assert.equal(memory.narrativeNoiseReason('同一类任务分别跑三组会话，用 analyze.py 对比：'), 'dangling')
+})
+
+test('元叙述过滤：好条目绝不能误伤（回归护栏）', () => {
+  for (const good of [
+    '结论：**架构必须是「核心引擎 + 薄适配层」，且核心引擎对适配层只做能力探测，不做能力假设。**',
+    '核心 CLI 启动时探测 OpenViking 配置（同一个开关同时决定记忆层和 spill 层）',
+    '这轮讨论的三个决定（不走 axon、插件化跨 harness、spill 双后端）+ 绩效考核 + 记忆同步，我都落进了文档：',
+    'Codex 每请求真正新增的内容中位数只有 679 est tokens；DSH 98.6% 的请求与之同源',
+    '决定：静态层裁剪切 active，300 字符上限',
+    '同一类任务，分别跑「无插件 / 影子 / 生效」三组会话做对比',
+  ]) assert.equal(memory.narrativeNoiseReason(good), null, `误伤：${good.slice(0, 30)}`)
+})
+
+test('元叙述过滤：extractCandidates 管道端到端生效', () => {
+  const text = `## 决策
+- 我先快速核实一下 DSH 的压缩实测数据，再回答你的问题
+- 决定：静态层裁剪切 active，300 字符上限
+- │   ├── spill.mjs   # 目录树行
+- 直接在臂里插桩定位：
+- 核心 CLI 启动时探测 OpenViking 配置（同一个开关同时决定记忆层和 spill 层）`
+  const cands = memory.extractCandidates(text)
+  const claims = cands.map((c) => c.claim)
+  assert.ok(claims.some((c) => c.includes('静态层裁剪切 active')), '好决策必须保留')
+  assert.ok(claims.some((c) => c.includes('OpenViking 配置')), '好事实必须保留')
+  assert.ok(!claims.some((c) => c.includes('我先快速核实')), '行为宣告必须被过滤')
+  assert.ok(!claims.some((c) => c.includes('spill.mjs')), '目录树行必须被过滤')
+  assert.ok(!claims.some((c) => c.includes('插桩定位')), '冒号尾碎片必须被过滤')
+})
+
+test('角色感知过滤：assistant 的选项菜单/你-向建议/要我-offer 不是记忆', () => {
+  for (const bad of [
+    '或者你现在重启一次 DSH——我刚加的 console.log 启动行生效后，终端直接能看到 loaded 行',
+    'A. 先切 active（1 分钟）：改 adapters/dsh/cordis.patch.yml 的 mode: active + 重启，工程量很小',
+    '**A. 先切 active（1 分钟）**：改 `adapters/dsh/cordis.patch.yml` 的 `mode: active` + 重启',
+    '要我改 cordis.patch.yml 的 mode: active + toolMaxDescr 吗',
+    '现在卫生措施就位了，可以放心切 active。要我改 cordis.patch.yml 里的 mode 吗',
+  ]) assert.equal(memory.narrativeNoiseReason(bad, { role: 'assistant' }) !== null, true, `应判噪声：${bad.slice(0, 30)}`)
+})
+
+test('角色感知过滤：用户轮次的同形指令必须保留（用户指令是真实决策）', () => {
+  for (const good of [
+    '不要重启 DSH，除非我明确说',
+    '你帮我看一下 adapters/dsh/cordis.patch.yml 的 mode 配置',
+    '可以把 mode 改成 active 吗',
+  ]) assert.equal(memory.narrativeNoiseReason(good, { role: 'user' }), null, `误伤用户指令：${good.slice(0, 30)}`)
+})
+
+test('角色感知过滤：role 缺省时保守（向后兼容，新形态不过滤）', () => {
+  assert.equal(memory.narrativeNoiseReason('或者你现在重启一次 DSH'), null)
+  assert.equal(memory.narrativeNoiseReason('A. 先切 active（1 分钟）：改配置'), null)
+})
+
+test('角色感知过滤：assistant 的实质内容不误伤', () => {
+  for (const good of [
+    '决定：静态层裁剪切 active，300 字符上限',
+    '影子数据攒几天后，我们看 report 里的分布再决定要不要切 active',
+    '数据够了我们就对照 docs/05 的验收线，决定切不切 active',
+  ]) assert.equal(memory.narrativeNoiseReason(good, { role: 'assistant' }), null, `误伤：${good.slice(0, 30)}`)
+})
+
+test('角色感知过滤：extractCandidates 管道 role 透传', () => {
+  // 注意：候选必须先能分类（决定/结论/事实/偏好）才进管道——纯祈使句不分类本就不产出，
+  // 所以 fixture 用真实噪声形态（选项菜单，含路径可分类为 fact），而不是人造的「决定：你…」
+  const text = '- A. 先切 active（1 分钟）：改 adapters/dsh/cordis.patch.yml 的 mode: active + 重启\n- 决定：静态层裁剪切 active，300 字符上限'
+  const a = memory.extractCandidates(text, { role: 'assistant' }).map((c) => c.claim)
+  assert.ok(!a.some((c) => c.includes('先切 active')), 'assistant 选项菜单必须被过滤')
+  assert.ok(a.some((c) => c.includes('静态层裁剪')), '实质决策必须保留')
+  const u = memory.extractCandidates(text, { role: 'user' }).map((c) => c.claim)
+  assert.ok(u.some((c) => c.includes('先切 active')), '用户轮次同形文本必须保留')
+})

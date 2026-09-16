@@ -34,10 +34,10 @@ function turnsOf(logPath) {
     let ev; try { ev = JSON.parse(line) } catch { continue }
     if (ev.type === 'user/message' && ev.data?.source?.kind === 'user') {
       const t = (ev.data.content ?? []).filter((b) => b?.type === 'text').map((b) => b.text).join('\n').trim()
-      if (t) turns.push(t)
+      if (t) turns.push({ text: t, role: 'user' })
     } else if (ev.type === 'assistant/message') {
       const t = (ev.data?.message?.content ?? []).filter((b) => b?.type === 'text').map((b) => b.text).join('\n').trim()
-      if (t) turns.push(t)
+      if (t) turns.push({ text: t, role: 'assistant' })
     }
   }
   return turns
@@ -56,7 +56,7 @@ const allCands = []
 for (const log of dirs) {
   const turns = turnsOf(log)
   totalTurns += turns.length
-  for (const t of turns) for (const c of memory.extractCandidates(t)) allCands.push(c)
+  for (const { text, role } of turns) for (const c of memory.extractCandidates(text, { role })) allCands.push(c)
 }
 
 // ---------- record 四选一（隔离库）----------

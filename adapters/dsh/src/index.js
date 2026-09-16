@@ -561,17 +561,20 @@ export function apply(ctx, config = {}) {
       maxSeq = Math.max(maxSeq, seq)
       const event = session.eventAt(seq)
       let t = null
+      let role = null   // 角色感知噪声过滤：assistant 的建议/要约/选项菜单不是记忆，用户指令是
       if (event?.type === 'user/message') {
         if (event.data?.source?.kind !== 'user') continue          // 插件注入/harness 伪装
         t = flattenTextBlocks(event.data?.content)
         if (t && profile.isHarnessTalk(t)) t = null
+        role = 'user'
       } else if (event?.type === 'assistant/message') {
         t = flattenTextBlocks(event.data?.message?.content)
+        role = 'assistant'
       }
       if (!t || capLeft.n <= 0) continue
       scanned++
       let produced = 0
-      for (const c of memory.extractCandidates(t)) {               // 纯内存，零 IO
+      for (const c of memory.extractCandidates(t, { role })) {      // 纯内存，零 IO
         if (capLeft.n-- <= 0) break
         const r = memory.record(meterBase, {
           ...c, source: 'incremental', sessionId: sessionKey,
@@ -761,7 +764,8 @@ export function apply(ctx, config = {}) {
           try {
             const text = (Array.isArray(event?.data?.summary) ? event.data.summary : [])
               .map((b) => (typeof b?.text === 'string' ? b.text : '')).join('\n')
-            const cands = memory.extractCandidates(text)
+            // 摘要文本是 LLM 蒸馏产物 → 按 assistant 角色过滤元叙述
+            const cands = memory.extractCandidates(text, { role: 'assistant' })
             let stored = 0; let idem = 0; let blocked = 0
             for (const c of cands) {
               const r = memory.record(meterBase, {
