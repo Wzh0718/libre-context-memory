@@ -456,7 +456,71 @@ async function main() {
     return 0
   }
 
-  console.error('用法: lcm <compress|read|recover|report|compare|sweep|stat|trim-diff|migrate|memory|profile>')
+  if (cmd === 'value') {
+    const { homedir } = await import('node:os')
+    const { computeValue } = await import('./value.mjs')
+    // 事件落点：全局根 + 历史散落的全项目根（实测 85% 的事件落在别的根）
+    const roots = new Set([cfg.meterDir, cfg.legacyMeterDir].filter(Boolean))
+    const projBase = join(homedir(), 'project')
+    if (existsSync(projBase)) {
+      for (const p of readdirSync(projBase)) {
+        const d = join(projBase, p, '.lcm')
+        if (existsSync(d)) roots.add(d)
+      }
+    }
+    const events = []
+    for (const dir of roots) {
+      for (const n of readdirSync(dir)) {
+        if (!/^meter(-\d{6})?\.jsonl$/.test(n)) continue
+        for (const line of readFileSync(join(dir, n), 'utf8').split('\n')) {
+          if (!line.trim()) continue
+          try { events.push(JSON.parse(line)) } catch { /* 坏行跳过 */ }
+        }
+      }
+    }
+    // 时间窗：--days N
+    const days = args.days ? Number(args.days) : 0
+    const since = days > 0 ? Date.now() - days * 86_400_000 : 0
+    const windowed = since > 0 ? events.filter((e) => (e.ts ?? 0) >= since) : events
+    // provenance：默认只统计 sessionsDir 里真实存在的会话（排除合成/测试数据）；--all 关闭
+    let known = null
+    if (!args.all) {
+      known = new Set()
+      if (cfg.sessionsDir && existsSync(cfg.sessionsDir)) {
+        for (const proj of readdirSync(cfg.sessionsDir)) {
+          try {
+            for (const sid of readdirSync(join(cfg.sessionsDir, proj))) known.add(sid)
+          } catch { /* 非目录跳过 */ }
+        }
+      }
+    }
+    const valueOpts = { knownSessions: known }
+    if (args['cache-factor']) valueOpts.cacheFactor = Number(args['cache-factor'])
+    const v = computeValue(windowed, valueOpts)
+    if (args.json) { console.log(JSON.stringify(v, null, 2)); return 0 }
+
+    const M = (n) => Math.abs(n) >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1e3)}k`
+    console.log(`价值记账（${v.sessions} 会话 / ${v.requests} 请求 · 折价因子 ${v.factor}`
+      + `${days > 0 ? ` · 近 ${days} 天` : ''}`
+      + ` · 反事实水位 ${M(v.ceiling.global)}[${v.ceiling.source}${v.ceiling.samples ? `×${v.ceiling.samples}` : ''}]`
+      + `${known ? ' · 仅真实会话' : ' · 含未归因数据'}）`)
+    console.log(`  实际成本当量    ${M(v.actualEq).padStart(8)} tok`)
+    console.log(`  反事实（无 lcm）${M(v.counterfactualEq).padStart(8)} tok（上界口径：假设无 lcm 时内容一直留在历史中）`)
+    console.log('  ── 已实现节省 ──────────────────────')
+    console.log(`  ① 压缩臂  ${M(v.realized.compress).padStart(8)}（1.0× 档：reshape 内容的首个承载请求 + 后续折价）`)
+    console.log(`  ② 剪枝臂  ${M(v.realized.prune).padStart(8)}（折价 × 后续请求数，击穿请求按 1.0×）`)
+    console.log(`  ③ 折叠臂  ${M(v.realized.fold).padStart(8)}（同剪枝机制）`)
+    console.log(`  ⑤ 注入开销 −${M(v.injectionCost).padStart(7)}（负项：注入 ${v.memory.injects} 次 / 命中 ${v.memory.entries} 条）`)
+    console.log(`  净节省    ${M(v.net).padStart(8)} = ${(v.netPct * 100).toFixed(1)}%（占反事实）`)
+    console.log('  ── 单列（不计入净节省）─────────────')
+    console.log(`  避免的击穿（piggyback）${M(v.avoidedBust)}（改写落在冷窗口，省下热窗口整段重发）`)
+    if (v.estimated.staticTrimPerRequest > 0) console.log(`  静态裁剪（估算，前缀层）每请求 −${v.estimated.staticTrimPerRequest.toLocaleString()} tok`)
+    if (v.cappedRequests > 0) console.log(`  被窗口夹住的请求 ${v.cappedRequests} 个（这部分内容本来也发不出去）`)
+    console.log('  口径：realized 已实现 / avoided 避免 / estimated 估算，三者严格分开。')
+    return 0
+  }
+
+  console.error('用法: lcm <compress|read|recover|report|value|compare|sweep|stat|trim-diff|migrate|memory|profile>')
   return 2
 }
 

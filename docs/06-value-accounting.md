@@ -47,40 +47,66 @@
 
 ## 4. 模型
 
-按会话分组、按 ts 排序，逐请求累加：
+按会话分组、按 ts 排序，逐请求累加（**review 修正版**，已实现于 `core/value.mjs`）：
 
 ```
 对每个会话 S：
-  ceiling(S) = min(模型窗口 − 输出预留, S 内观测到的最大载荷)
+  L = 全部会话「compaction 事件前最近一次 usage 载荷」的中位   ← DSH 内置压缩的实测触发水位
+  ceiling(S) = max(S 实际最大载荷, min(L, 模型窗口 − 输出预留))
   active = 0
   对 S 内每个 usage 请求 u（按时间序）：
-     把 ts ≤ u.ts 的臂动作累加进 active：active += (charsBefore − charsAfter)/2
-     delta = max(0, min(active, ceiling − actualPayload))     ← 夹窗口
-     realized(u) = delta × tier(u)
-     tier(u) = 1.0（该内容首次进入请求）后续 = cacheFactor（默认 0.1）
+     把 ts ≤ u.ts 的臂动作累加进 active
+     room  = max(0, ceiling − 实际载荷(u))
+     delta = min(active, room)                                ← 夹窗口
+     price(u) = 1.0（u 是击穿请求：cacheBust 或 fresh ≥ 50k）
+                否则 = cacheFactor
+     定价（review 修正——首版把 delta 按 1.0× 计入每个后续请求，虚高约 7 倍）：
+       prune/fold：被剪内容早已在缓存前缀里 → 按 price(u) 计
+       compress：reshape 的内容在无臂世界会作为新内容进下一个请求
+                 → 首个后续请求按 1.0×，之后按 price(u) 计
+     realized(u) = Σ_臂 attributed × 档价（按动作 ts 序老者先填充 room 归因）
   实际成本   += input + cacheRead × cacheFactor
-  反事实成本 += (input + delta) + cacheRead × cacheFactor      ← 保守：delta 按 fresh 取高
+  反事实成本 += 实际成本 + realized(u)
 
-净节省 = 反事实成本 − 实际成本 − 注入开销 − 画像段开销
-avoided（单列）= Σ_冷窗口改写 (改写下一次请求的载荷)
-estimated（单列）= 记忆命中替代的重复解释轮次 × 该会话平均请求成本
+净节省 = 已实现节省 − 注入开销（同会话首次 1.0×、重复折价）
+avoided（单列）= Σ_臂动作 (动作前最近一次 usage 的载荷)
+estimated（单列）= 静态裁剪中位节省/请求（全局事件，无 sessionId，无法归因）
 ```
 
-### 为什么必须夹窗口（试算踩到的坑）
+### 为什么必须夹窗口 + 必须按档计价（两次试算踩到的坑）
 
-首版模型不夹窗口：算出「节省 243.9M > 实际花费 131.1M（186%）」——**不可能**。
+**坑一（不夹窗口）**：算出「节省 243.9M > 实际花费 131.1M（186%）」——不可能。
 根因：被剪掉的内容在「无臂」世界里也会超出上下文窗口，根本不会被发送。
-加上窗口上限后：实际 131.2M / 反事实 290.3M / 节省 159.1M（54.8%），守恒成立；
-1416 个请求被窗口夹住（正是「本来也发不出去」的那部分内容）。
 
-### 模型的自证不变量（写成测试）
+**坑二（定价错误，review 发现）**：夹窗口后算出 54.8%，但 delta 被按 1.0× fresh
+计入**每一个**后续请求。实际上未被剪掉的内容躺在缓存前缀里，后续请求只付折价
+（95% 命中率下均价 ≈ 0.145×）。修正后：
 
-1. **反事实 ≥ 实际**（逐请求成立）
+```
+实测（已实现 core/value.mjs，140 真实会话 / 4941 请求，provenance 过滤后）：
+  实际成本当量 140.2M ｜ 反事实 165.1M ｜ 净节省 24.9M = 15.1%（占反事实）
+  压缩臂 6.7M ｜ 剪枝臂 18.2M ｜ 折叠臂 0（从未 active）｜ 注入 0（shadow 期）
+  避免的击穿 70.9M（单列）｜ 反事实水位 242k（1895 次 compaction 实测中位）
+  被窗口夹住的请求 1186 个
+```
+
+交叉验证：bench-all 载荷口径 11.9% vs 本模型 15.1%——同向、同量级 ✓
+（差异来源：成本当量里压缩臂按 1.0× 计的首个承载请求权重更高，载荷口径则等权）。
+
+### 模型的自证不变量（已写成测试，`core/test/value.test.mjs` 17 个）
+
+1. **反事实 ≥ 实际**（逐请求由构造保证，总量断言）
 2. **节省 ≤ 反事实成本**（否则必是重复计数）
 3. **每请求 delta ≤ ceiling − actualPayload**（夹窗口生效）
 4. **无臂动作时节省恰为 0**（空输入 → 零输出）
 5. **确定性**：同输入同输出（账本可复核）
 6. **单调性**：多加一个臂动作，节省不减少
+7. **定价正确性**：prune 在命中请求按折价、击穿按 1.0×；compress 首个承载请求
+   按 1.0× 之后按档；注入首次 1.0× 重复折价
+8. **provenance**：sessionId 不在 sessionsDir 真实会话集合里的事件被排除
+   （`~/.lcm/meter-000000.jsonl` 等合成/基线数据不混入台账）
+9. **交叉验证门**：与 bench-all 载荷口径必须同向、同量级——首版 54.8% vs 11.9%
+   差了 4.6 倍，正是这道门抓住了定价 bug
 
 ## 5. 归因边界（诚实声明）
 
@@ -114,12 +140,12 @@ $ lcm value [--days 7] [--cache-factor 0.1] [--json]
 
 ## 7. 实施拆分与验收
 
-| 阶段 | 内容 | 验收 |
+| 阶段 | 内容 | 状态 |
 |---|---|---|
-| **P1** | `core/value.mjs`：纯函数模型（事件数组 → 价值模型），零 IO 便于测 | 6 条不变量测试全绿；真实台账试算守恒 |
-| **P2** | CLI `lcm value`（人读 + `--json`，`--cache-factor`/`--days` 可调） | 真实数据跑通，输出与试算一致 |
-| **P3** | 补埋点：`static-trim` 记 `savedChars`；`fold` 记 `payloadTokens`（avoided 用） | 契约测试锁定字段 |
-| **P4** | 接入 `lcm report`（价值段）+ README + 与 bench-all 交叉验证脚本 | 两个口径同向、量级可比 |
+| **P1** | `core/value.mjs`：纯函数模型（事件数组 → 价值模型），零 IO | ✅ 17 个不变量测试全绿；真实台账试算守恒 |
+| **P2** | CLI `lcm value`（人读 + `--json`，`--cache-factor`/`--days`/`--all`） | ✅ 真实数据跑通：140 会话净省 15.1% |
+| **P3** | 埋点复核：`static-trim` 用现有 `charsBefore/After`（无需新埋点，进估算行）；`fold` 的 `payloadTokens` 待 fold active 后补 | 🚧 fold 字段待补 |
+| **P4** | 接入 `lcm report`（价值段）+ 与 bench-all 交叉验证脚本化（同向同量级断言） | ⬜ 待做 |
 
 ## 8. 已知限制 / 不做
 
