@@ -143,3 +143,22 @@ test('放行 gate：跨会话样本充足时以跨会话为准；不达标必须
   const r2 = ev.runEval(cfg, golden2)
   assert.equal(r2.penetration, 0, '无 expectEmpty/forbidId 的反例不构成击穿')
 })
+
+test('污染率：池化口径出现外项目槽位，生产口径（同项目）为 0', () => {
+  const { cfg } = setup()
+  memory.record(cfg, { type: 'fact', subject: 'quant 策略', claim: 'libre_quant 回测用 walk-forward 验证', project: '/p/quant' })
+  memory.record(cfg, { type: 'fact', subject: 'html 转换', claim: 'html_to_md 正文抽取用 cheerio 回测验证', project: '/p/html' })
+  const quantId = memory.activeEntries(cfg).find((e) => e.subject === 'quant 策略').id
+  const golden = {
+    positives: [{ query: '回测 验证', expectId: quantId, project: '/p/quant', kind: 'cross' }],
+    negatives: [],
+  }
+  const pooled = ev.runEval(cfg, golden, { projectScope: 'all' })
+  const scoped = ev.runEval(cfg, golden, { projectScope: 'same' })
+  assert.ok(pooled.contamination > 0, '池化口径下必须观测到外项目槽位')
+  assert.equal(scoped.contamination, 0, '生产口径下外项目槽位必须为 0')
+  assert.equal(scoped.excludedByScope > 0, true, '必须报告被隔离的候选数（可观测）')
+  // 同项目条目在两种口径下都必须召回
+  assert.equal(pooled.recall, 1)
+  assert.equal(scoped.recall, 1)
+})

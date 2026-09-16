@@ -829,3 +829,40 @@ test('折叠臂安全默认：熔炼臂关闭（无水位线）→ 冷窗口也�
   assert.equal(readMeterEvents(lcmRoot, 'fold').length, 0, '无水位线 = 无蒸馏依据 = 绝不折叠')
   assert.equal(session.appends.length, 0)
 })
+
+test('记忆注入臂：任务事实按项目隔离，画像/全局条目跨项目可见', async () => {
+  const ctx = fakeCtx()
+  const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-memscope-'))
+  applyT(ctx, { mode: 'active', lcmRoot, memoryInjectMode: 'active' })
+  const { record, setProfile, activeEntries } = await import('../../../core/memory.mjs')
+  // 两个项目共享查询 token（回测/验证），否则「没注入」只是不相关，隔离没被考到
+  record(lcfg(lcmRoot), { type: 'fact', subject: 'quant 策略', claim: 'libre_quant 回测用 walk-forward 验证', project: '/home/libre/project/libre_quant' })
+  record(lcfg(lcmRoot), { type: 'fact', subject: 'html 转换', claim: 'html_to_md 正文抽取用 cheerio 回测验证', project: '/home/libre/project/html_to_md' })
+  record(lcfg(lcmRoot), { type: 'preference', subject: '全局偏好', claim: '回答一律用中文并给回测验证证据', project: null })
+  const p = record(lcfg(lcmRoot), { type: 'preference', subject: '提问风格', claim: '偏好先给回测验证证据再给结论', project: '/home/libre/project/html_to_md' })
+  setProfile(lcfg(lcmRoot), activeEntries(lcfg(lcmRoot)).find((e) => e.subject === '提问风格').id, true, { by: 'test' })
+  void p
+
+  const session = fakeSession('/home/libre/project/libre_quant', [])
+  const base = { kind: 'run', messages: [{ role: 'user', content: [{ type: 'text', text: '回测 验证' }], source: { kind: 'user' } }] }
+  const out = await runPreStepWithDecision(ctx, session, base)
+  assert.equal(out.messages.length, 2, '同项目/全局/画像条目必须能注入')
+  const text = out.messages[1].content[0].text
+  assert.ok(text.includes('quant 策略'), '同项目条目必须注入')
+  assert.ok(text.includes('全局偏好'), '无 project 的全局条目必须注入')
+  assert.ok(text.includes('提问风格'), '画像条目跨项目必须注入')
+  assert.ok(!text.includes('html 转换'), '其它项目的任务事实绝不能注入（隔离）')
+})
+
+test('记忆注入臂：projectScope=all 时恢复池化（显式跨项目开关可用）', async () => {
+  const ctx = fakeCtx()
+  const lcmRoot = mkdtempSync(join(tmpdir(), 'lcm-memscope-all-'))
+  applyT(ctx, { mode: 'active', lcmRoot, memoryInjectMode: 'active', memoryInjectProjectScope: 'all' })
+  const { record } = await import('../../../core/memory.mjs')
+  record(lcfg(lcmRoot), { type: 'fact', subject: 'html 转换', claim: 'html_to_md 正文抽取用 cheerio 回测验证', project: '/home/libre/project/html_to_md' })
+  const session = fakeSession('/home/libre/project/libre_quant', [])
+  const base = { kind: 'run', messages: [{ role: 'user', content: [{ type: 'text', text: '回测 验证' }], source: { kind: 'user' } }] }
+  const out = await runPreStepWithDecision(ctx, session, base)
+  assert.equal(out.messages.length, 2, 'all 口径下应可跨项目注入')
+  assert.ok(out.messages[1].content[0].text.includes('html 转换'))
+})

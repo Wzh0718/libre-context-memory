@@ -61,13 +61,8 @@ function projectOfDir(logPath) {
   return normalizeProject(logPath.split('/').at(-3))
 }
 
-/** 项目键规范化：条目存的是 cwd（/home/libre/project/x），会话目录名是短横线形
- *  （--home-libre-project-x--）。不归一 → 跨会话配对恒为 0（生产环境踩点）。 */
-export function normalizeProject(p) {
-  if (!p) return '__none__'
-  const s = String(p).replace(/^[-\/]+|[-\/]+$/g, '')   // 斜杠与短横线都要剥（否则 cwd 形残留前导 -）
-  return s.replace(/\//g, '-')
-}
+/** 项目键规范化：实现移至 memory.mjs（检索隔离与评测共用同一套规则），此处转发。 */
+export const normalizeProject = memory.normalizeProject
 
 export function buildGolden(cfg, { sessionsDir, maxPerSession = 6, logLimit = 200, crossMaxPerEntry = 3, crossMinOverlap = 2 } = {}) {
   const all = memory.loadAll(cfg)
@@ -195,8 +190,10 @@ export function buildGolden(cfg, { sessionsDir, maxPerSession = 6, logLimit = 20
 }
 
 /** 跑评测。返回 {recall, hits, total, penetration, misses, penetrationDetails, byKind, ok}。 */
-export function runEval(cfg, golden, { k = EVAL_K, mode = memory.DEFAULT_SCORE_MODE, blend = false } = {}) {
+export function runEval(cfg, golden, { k = EVAL_K, mode = memory.DEFAULT_SCORE_MODE, blend = false, projectScope = 'same' } = {}) {
   const results = new Map()   // query → id 列表
+  // 污染率（新指标）：注入槽位里来自**其它项目**的占比。生产 search 曾完全不按项目隔离，
+  // 实测 35.8% 的槽位是外项目条目——质量与保密卫生双输。评测与生产必须同口径。
   // 会话画像混合（A2）：画像取自**查询所属会话**自己的条目——生产同款行为。
   // 注意循环风险：期望条目可能就在画像里（等于把答案塞进查询），故必须 A/B 实测
   const profileCache = new Map()
@@ -210,17 +207,29 @@ export function runEval(cfg, golden, { k = EVAL_K, mode = memory.DEFAULT_SCORE_M
     const share = memory.profileShareOf(1)
     return memory.blendQuery(p.query, prof, { share })
   }
-  const queryIds = (q) => {
-    if (!results.has(q)) results.set(q, memory.search(cfg, q, { k, mode }).map((e) => e.id))
-    return results.get(q)
+  const hitsByProject = new Map()   // query → {ids, foreign}
+  const queryIds = (q, project = null) => {
+    if (!hitsByProject.has(q)) {
+      const r = memory.searchDetailed(cfg, q, { k, mode, project, projectScope })
+      const key = memory.normalizeProject(project)
+      // 无 project 的条目（手动/全局）与画像条目不算污染——设计上就该全局
+      const foreign = r.entries.filter((e) => e.project && e.profile !== true && memory.normalizeProject(e.project) !== key).length
+      hitsByProject.set(q, { ids: r.entries.map((e) => e.id), foreign, foreignExcluded: r.foreignExcluded })
+    }
+    return hitsByProject.get(q).ids
   }
+  let slots = 0, foreignSlots = 0, excludedTotal = 0
   let hits = 0
   const misses = []
   const byKind = {}
   const rankSum = { all: 0, n: 0, cross: 0, nCross: 0 }   // MRR 累加（1/rank，未命中记 0）
   let top1 = { all: 0, cross: 0 }
   for (const p of golden.positives) {
-    const ids = queryIds(shapedQuery(p))
+    const ids = queryIds(shapedQuery(p), p.project ?? null)
+    const st = hitsByProject.get(shapedQuery(p))
+    slots += ids.length
+    foreignSlots += st?.foreign ?? 0
+    excludedTotal += st?.foreignExcluded ?? 0
     const rank = ids.indexOf(p.expectId)          // -1 = 未命中
     const hit = rank >= 0
     const rr = hit ? 1 / (rank + 1) : 0
@@ -255,8 +264,13 @@ export function runEval(cfg, golden, { k = EVAL_K, mode = memory.DEFAULT_SCORE_M
   const mrrCross = rankSum.nCross === 0 ? null : Number((rankSum.cross / rankSum.nCross).toFixed(4))
   const top1Rate = rankSum.n === 0 ? null : Number((top1.all / rankSum.n).toFixed(4))
   const top1Cross = rankSum.nCross === 0 ? null : Number((top1.cross / rankSum.nCross).toFixed(4))
+  const contamination = slots === 0 ? null : Number((foreignSlots / slots).toFixed(4))
   return {
     k, total, hits,
+    projectScope,
+    contamination,
+    foreignSlots,
+    excludedByScope: excludedTotal,
     recall: recall === null ? null : Number(recall.toFixed(4)),
     mrr, mrrCross, top1: top1Rate, top1Cross,
     primary,

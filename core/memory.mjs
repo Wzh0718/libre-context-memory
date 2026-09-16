@@ -470,15 +470,39 @@ export function blendQuery(userQuery, profileText, { share = 0, maxShare = 0.7 }
   return `${u} ${cut}`
 }
 
-export function search(cfg, query, { k = 6, maxChars = 2_500, qualityBoostOf = null, mode = DEFAULT_SCORE_MODE } = {}) {
+/**
+ * 检索（项目作用域）：记忆库是全局的（~/.lcm/memories），但**任务事实必须按项目隔离**——
+ * 实测池化检索时 35.8% 的注入槽位来自其它项目（质量 + 保密卫生双输）。
+ * 规则：
+ * - projectScope 'same'（传了 project 时的默认）：只召回同项目条目；
+ *   例外保持全局 —— 无 project 的条目（手动入库/全局约定）与画像条目（profile=true，
+ *   跨会话「习惯画像」本来就该全局）。
+ * - projectScope 'all'：旧的池化行为（显式跨项目/未传 project 时）。
+ * 归一化：条目存 cwd（/home/libre/project/x），会话目录名是短横线形
+ * （--home-libre-project-x--），两者必须归一到同一项目键。
+ */
+export function normalizeProject(p) {
+  if (!p) return '__none__'
+  const s = String(p).replace(/^[-/]+|[-/]+$/g, '')   // 斜杠与短横线都要剥（否则 cwd 形残留前导 -）
+  return s.replace(/\//g, '-')
+}
+
+export function searchDetailed(cfg, query, { k = 6, maxChars = 2_500, qualityBoostOf = null, mode = DEFAULT_SCORE_MODE, project = null, projectScope = null } = {}) {
   const q = tokensOf(query)
-  if (q.size === 0) return []
+  const scope = projectScope ?? (project ? 'same' : 'all')
+  if (q.size === 0) return { entries: [], project, projectScope: scope, considered: 0, foreignExcluded: 0 }
   const now = Date.now()
+  const key = scope === 'same' ? normalizeProject(project) : null
   const scored = []
+  let foreignExcluded = 0
+  let considered = 0
   for (const e of activeEntries(cfg)) {
     const boost = qualityBoostOf ? qualityBoostOf(e) : 1      // 画像加成等外部因子
     const score = readScore(e, q, { now, qualityBoost: boost, mode })
-    if (score > 0) scored.push({ ...e, score, _rel: relevanceOf(e, q) })
+    if (!(score > 0)) continue
+    considered++
+    if (key != null && !isScopeEligible(e, key)) { foreignExcluded++; continue }
+    scored.push({ ...e, score, _rel: relevanceOf(e, q) })
   }
   if (mode === 'lexicographic') {
     // 相关度优先、质量次之——不做乘法混合（乘法在真实数据上被证明是噪声，见 score-ab）
@@ -496,7 +520,18 @@ export function search(cfg, query, { k = 6, maxChars = 2_500, qualityBoostOf = n
     out.push(e)
     used += cost
   }
-  return out
+  return { entries: out, project, projectScope: scope, considered, foreignExcluded }
+}
+
+/** 作用域资格：同项目 / 无项目（全局）/ 画像条目（profile=true，习惯画像本就全局）。 */
+function isScopeEligible(e, key) {
+  if (!e.project) return true
+  if (e.profile === true) return true
+  return normalizeProject(e.project) === key
+}
+
+export function search(cfg, query, opts = {}) {
+  return searchDetailed(cfg, query, opts).entries
 }
 
 /** 注入块确定性渲染：同条目集 → 逐字节相同（尾部追加纪律的前提）。 */

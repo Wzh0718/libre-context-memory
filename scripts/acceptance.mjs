@@ -83,12 +83,14 @@ if (existsSync(join(evalStore, 'memories', 'memories.jsonl'))) {
         const cross = r.primary?.recall ?? r.recall ?? null
         const total = r.primary?.total ?? null
         const pen = r.penetration ?? 0
-        const ok = cross != null && cross >= 0.8 && pen === 0
+        const contam = r.contamination
+        const ok = cross != null && cross >= 0.8 && pen === 0 && contam === 0
         return {
           ok,
           detail: `跨会话 recall@6 ${cross == null ? '—' : (cross * 100).toFixed(1) + '%'}`
             + `${total ? `（${total} 对）` : ''} ｜ 反例击穿 ${pen}`
-            + `${ok ? '' : '（门槛 <80% 或击穿 >0 或字段缺失）'}`,
+            + ` ｜ 跨项目污染 ${contam == null ? '—' : (contam * 100).toFixed(1) + '%'}`
+            + `${ok ? '' : '（门槛 recall<80% / 击穿>0 / 污染>0 / 字段缺失）'}`,
         }
       } catch { return { ok: false, detail: '输出无法解析为 JSON' } }
     },

@@ -537,3 +537,78 @@ test('B5 容量：字节超限也会触发（条目数未超）', async () => {
   const res = mem.enforceCapacity(cfg, { maxEntries: 10_000, maxBytes: 500 })
   assert.ok(res.over && res.archived > 0, '字节超限也必须治理')
 })
+
+// ─────────────────────────── 项目作用域（注入隔离）───────────────────────────
+// 生产 blocker：记忆库是全局的（~/.lcm/memories），search 原本不按项目过滤，
+// 实测 35.8% 的注入槽位来自其它项目（质量 + 保密卫生）。规则：
+//   同项目**任务事实**默认隔离；无 project 的条目（手动/全局）与画像条目（profile/pinned）
+//   保持全局——跨会话「习惯画像」本来就该全局，任务事实不该。
+
+function seedProjects(cfg) {
+  // 关键：两条项目条目**共享查询 token**（回测/验证），否则「查不到」只是因为不相关，
+  // 隔离根本没被考到——这类假通过必须避免。
+  memory.record(cfg, { type: 'fact', subject: 'quant 策略', claim: 'libre_quant 的回测用 walk-forward 验证', project: '/home/libre/project/libre_quant' })
+  memory.record(cfg, { type: 'fact', subject: 'html 转换', claim: 'html_to_md 的正文抽取用 cheerio 回测验证', project: '/home/libre/project/html_to_md' })
+  memory.record(cfg, { type: 'preference', subject: '全局偏好', claim: '回答一律用中文并给回测验证证据', project: null })
+}
+
+test('注入隔离：默认只召回同项目的任务事实', () => {
+  const cfg = makeCfg()
+  seedProjects(cfg)
+  // 池化基线：不隔离时两条项目条目都会被召回（证明查询确实同时命中两者）
+  const pooled = memory.search(cfg, '回测 验证', { k: 10, projectScope: 'all' })
+  assert.ok(pooled.some((h) => h.project === '/home/libre/project/libre_quant'))
+  assert.ok(pooled.some((h) => h.project === '/home/libre/project/html_to_md'), '池化基线必须能命中外项目条目')
+  // 隔离后：外项目条目必须消失
+  const hits = memory.search(cfg, '回测 验证', { k: 10, project: '/home/libre/project/libre_quant' })
+  assert.ok(hits.some((h) => h.project === '/home/libre/project/libre_quant'), '同项目条目必须召回得到')
+  assert.ok(!hits.some((h) => h.project === '/home/libre/project/html_to_md'), '不得召回其它项目的任务事实')
+  assert.ok(hits.some((h) => h.project === null), '无 project 的全局条目仍应可选')
+})
+
+test('注入隔离：无 project 的全局条目始终可选（手动入库/画像）', () => {
+  const cfg = makeCfg()
+  seedProjects(cfg)
+  const hits = memory.search(cfg, '回测 验证 全局偏好', { k: 10, project: '/home/libre/project/libre_quant' })
+  assert.ok(hits.some((h) => h.project === null), '全局条目必须在隔离模式下仍可见')
+})
+
+test('注入隔离：画像条目（profile/pinned）跨项目仍可选——习惯画像本就全局', () => {
+  const cfg = makeCfg()
+  seedProjects(cfg)
+  const e = memory.record(cfg, { type: 'preference', subject: '提问风格', claim: '用户偏好先给证据再给结论', project: '/home/libre/project/prompt-lab' })
+  memory.setProfile(cfg, e.id ?? memory.activeEntries(cfg).find((x) => x.subject === '提问风格').id, true, { by: 'test' })
+  const hits = memory.search(cfg, '用户偏好先给证据再给结论 提问风格', { project: '/home/libre/project/libre_quant' })
+  assert.ok(hits.some((h) => h.subject === '提问风格'), '画像条目必须跨项目可见')
+})
+
+test('注入隔离：projectScope=all 保留旧的池化行为（显式跨项目）', () => {
+  const cfg = makeCfg()
+  seedProjects(cfg)
+  const hits = memory.search(cfg, 'html_to_md cheerio 抽正文', { project: '/home/libre/project/libre_quant', projectScope: 'all' })
+  assert.ok(hits.some((h) => h.project === '/home/libre/project/html_to_md'), 'all 模式下应召回其它项目条目')
+})
+
+test('注入隔离：不传 project 时保持向后兼容（池化）', () => {
+  const cfg = makeCfg()
+  seedProjects(cfg)
+  const hits = memory.search(cfg, 'html_to_md cheerio 抽正文')
+  assert.ok(hits.some((h) => h.project === '/home/libre/project/html_to_md'))
+})
+
+test('注入隔离：cwd 形与短横线形项目键必须互相匹配（归一化）', () => {
+  const cfg = makeCfg()
+  seedProjects(cfg)
+  const hits = memory.search(cfg, '回测 验证', { k: 10, project: '--home-libre-project-libre_quant--' })
+  assert.ok(hits.some((h) => h.project === '/home/libre/project/libre_quant'), '两种项目键形态必须归一到同一项目')
+})
+
+test('注入隔离：searchDetailed 报告被排除的外项目条目数（可观测）', () => {
+  const cfg = makeCfg()
+  seedProjects(cfg)
+  const d = memory.searchDetailed(cfg, 'libre_quant 回测 walk-forward html_to_md cheerio', { project: '/home/libre/project/libre_quant' })
+  assert.ok(d.entries.length >= 1)
+  assert.ok(d.foreignExcluded >= 1, '必须报告被隔离的外项目候选数')
+  assert.equal(d.project, '/home/libre/project/libre_quant')
+  assert.equal(d.projectScope, 'same')
+})

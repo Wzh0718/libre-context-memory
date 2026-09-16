@@ -474,11 +474,16 @@ async function main() {
       return r.ok ? 0 : 1
     }
     if (sub === 'search' || sub === 'inject') {
-      if (!args.query) { console.error('用法: lcm memory search --query <查询> [--k 6]'); return 2 }
-      const hits = mem.search(cfg, args.query, { k: Number(args.k ?? 6) })
+      if (!args.query) { console.error('用法: lcm memory search --query <查询> [--k 6] [--project <cwd>] [--scope same|all]'); return 2 }
+      // 项目作用域（默认与生产一致）：传了 --project 就按同项目隔离，画像是例外
+      const project = args.project ?? null
+      const scope = args.scope ?? (project ? 'same' : 'all')
+      const d = mem.searchDetailed(cfg, args.query, { k: Number(args.k ?? 6), project, projectScope: scope })
+      const hits = d.entries
       if (sub === 'search') {
-        for (const e of hits) console.log(`[${e.type}] ${e.subject}：${e.claim}  (score ${e.score.toFixed(1)}, ${e.id})`)
-        console.error(`[lcm] ${hits.length} 条命中`)
+        for (const e of hits) console.log(`[${e.type}] ${e.subject}：${e.claim}  (score ${e.score.toFixed(1)}, ${e.project ?? '全局'}, ${e.id})`)
+        console.error(`[lcm] ${hits.length} 条命中（scope=${d.projectScope}${d.project ? `, project=${d.project}` : ''}`
+          + `${d.foreignExcluded ? `，隔离掉 ${d.foreignExcluded} 条外项目候选` : ''}）`)
         return 0
       }
       const block = mem.renderInjectBlock(args.query, hits)

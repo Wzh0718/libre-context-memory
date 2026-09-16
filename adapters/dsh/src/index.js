@@ -65,6 +65,7 @@ const DEFAULTS = {
   foldKeepLastTurns: 4,         // 最新 N 个对话节点永不折叠（活跃上下文）
   memoryInjectMode: 'shadow',  // 记忆注入单独模式：shadow 只记账；active 在请求尾部追加检索块（前缀安全）
   memoryInjectMaxEntries: 6,   // 注入块条目上限（预算纪律：注入自身不能成为体积源）
+  memoryInjectProjectScope: 'same',   // 'same' = 任务事实按项目隔离（画像/全局条目不受限）；'all' = 池化（跨项目，慎用）
   memoryQueryBlend: false,     // 查询混合会话画像：A/B 实测略降排序（见 memory.blendQuery 注释），默认关
   memoryProfileInjectMaxEntries: 8, // 画像条目常驻段条目上限（字符预算另有 PROFILE_MAX_CHARS 封顶）
   // —— 静态层裁剪臂（system-prompt/assemble）——
@@ -664,7 +665,16 @@ export function apply(ctx, config = {}) {
       // 画像加成（A3）：晋升条目读时 ×1.2（pin 或跨会话复现达标的条目）
       let boostOf = null
       try { boostOf = memory.profileBoostOf(meterBase) } catch { /* 画像缺失静默 */ }
-      const entries = query ? memory.search(meterBase, query, { k: cfg.memoryInjectMaxEntries, qualityBoostOf: boostOf }) : []
+      // 项目作用域（生产 blocker 修复）：任务事实按项目隔离（实测池化口径 22.7% 槽位
+      // 来自其它项目、recall 98.4%）；画像/无 project 条目保持全局（习惯画像本就全局）。
+      const injectScope = cfg.memoryInjectProjectScope ?? 'same'
+      const injectProject = agent?.session?.header?.cwd ?? null
+      const entries = query
+        ? memory.search(meterBase, query, {
+          k: cfg.memoryInjectMaxEntries, qualityBoostOf: boostOf,
+          project: injectProject, projectScope: injectScope,
+        })
+        : []
       const block = entries.length > 0 ? memory.renderInjectBlock(query, entries) : null
       // 用户画像条目常驻段（预算 ≤800 chars，pin 与自动晋升都在内）
       let profileMemBlock = null
@@ -793,5 +803,5 @@ export function apply(ctx, config = {}) {
     }
   } catch { /* 记忆库不可读不阻塞启动 */ }
   console.log(`[dsh-lcm] loaded, mode=${cfg.mode}, maxInlineChars=${cfg.maxInlineChars}, pruneProactive=${cfg.pruneProactive}, memoryInject=${cfg.memoryInjectMode}`
-    + `, memory=${startupStats.entries ?? '?'}条/画像${startupStats.profile ?? '?'}条, fold=${cfg.foldMode}, incremental=${cfg.memoryExtractIncremental}, queryBlend=${cfg.memoryQueryBlend}`)
+    + `, memory=${startupStats.entries ?? '?'}条/画像${startupStats.profile ?? '?'}条, fold=${cfg.foldMode}, incremental=${cfg.memoryExtractIncremental}, queryBlend=${cfg.memoryQueryBlend}, injectScope=${cfg.memoryInjectProjectScope ?? 'same'}`)
 }
