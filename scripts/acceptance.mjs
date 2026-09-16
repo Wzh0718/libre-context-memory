@@ -123,9 +123,12 @@ if (BENCH_N > 0) {
   await gate(`载荷口径基准（${BENCH_N} 会话）`, 'node', ['scripts/bench-all.mjs', String(BENCH_N), '4'], {
     timeout: 40 * 60_000,
     check: (out) => {
-      const pct = /省 ([\d.]+)%/.exec(out.split('\n').find((l) => l.includes('累计载荷')) ?? '')?.[1]
-      const ok = pct != null && Number(pct) > 0
-      return { ok, detail: `累计载荷省 ${pct ?? '—'}%` }
+      // 真实格式：累计载荷：X → Y tok （省 Z tok = 17.6%）
+      const line = out.split('\n').find((l) => l.includes('累计载荷')) ?? ''
+      const pct = /= ([\d.]+)%/.exec(line)?.[1]
+      if (pct == null) return { ok: false, detail: '未找到合计行（bench-all 可能提前退出或输出格式变了）' }
+      const ok = Number(pct) > 0
+      return { ok, detail: `累计载荷省 ${pct}%` }
     },
   })
 } else {
