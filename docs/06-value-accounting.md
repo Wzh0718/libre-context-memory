@@ -142,10 +142,10 @@ $ lcm value [--days 7] [--cache-factor 0.1] [--json]
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| **P1** | `core/value.mjs`：纯函数模型（事件数组 → 价值模型），零 IO | ✅ 17 个不变量测试全绿；真实台账试算守恒 |
-| **P2** | CLI `lcm value`（人读 + `--json`，`--cache-factor`/`--days`/`--all`） | ✅ 真实数据跑通：140 会话净省 15.1% |
-| **P3** | 埋点复核：`static-trim` 用现有 `charsBefore/After`（无需新埋点，进估算行）；`fold` 的 `payloadTokens` 待 fold active 后补 | 🚧 fold 字段待补 |
-| **P4** | 接入 `lcm report`（价值段）+ 与 bench-all 交叉验证脚本化（同向同量级断言） | ⬜ 待做 |
+| **P1** | `core/value.mjs`：纯函数模型（事件数组 → 价值模型），零 IO | ✅ 21 个不变量测试全绿；真实台账试算守恒 |
+| **P2** | CLI `lcm value`（人读 + `--json`，`--cache-factor`/`--days`/`--all`） | ✅ 真实数据跑通：144 会话净省 15.0% |
+| **P3** | 埋点复核：`static-trim` 用现有 `charsBefore/After`（进估算行）；`fold` 补 `payloadTokens`（avoided 兜底，契约测试锁定）；value 模型 avoided 兜底链 = 前置 usage 载荷 → `tokensBefore`/`payloadTokens` | ✅ 完成（avoided 70.9M → 73.7M，兜底生效） |
+| **P4** | 价值段接入 `lcm report`（一行硬账）；交叉验证**脚本化**：模型内置载荷口径（`payload.pct`）与成本当量口径互证（ratio ∈ [0.3, 3]），`scripts/value-xcheck.mjs` 退出码 0/1 | ✅ 完成（实测 ratio 1.02：载荷 14.7% vs 成本 15.0%） |
 
 ## 8. 已知限制 / 不做
 

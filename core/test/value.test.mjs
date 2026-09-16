@@ -227,3 +227,41 @@ test('默认值常量存在且保守', () => {
   assert.ok(VALUE_DEFAULTS.windowTokens > 0)
   assert.ok(VALUE_DEFAULTS.bustMinFreshTokens > 0)
 })
+
+test('avoided 兜底：无前置 usage 时用动作自带载荷（prune.tokensBefore）', () => {
+  clock = 0
+  const v = computeValue([
+    prune(SID, 5000, 1000),    // tokensBefore = 2500（helper 按 charsBefore/2 记）
+    usage(SID),
+  ], OPTS)
+  assert.equal(v.avoidedBust, 2500)
+})
+
+test('avoided 兜底：fold 用 payloadTokens 字段', () => {
+  clock = 0
+  const v = computeValue([
+    { ts: ts(), kind: 'fold', sessionId: SID, charsBefore: 4000, charsAfter: 200, payloadTokens: 88_000 },
+    usage(SID),
+  ], OPTS)
+  assert.equal(v.avoidedBust, 88_000)
+})
+
+test('载荷口径与成本当量口径同向同量级（内置交叉验证）', () => {
+  clock = 0
+  const v = computeValue([
+    prune(SID, 50_000, 1000),     // S = 24_500
+    usage(SID, { input: 200, cacheRead: 9_800 }),
+    usage(SID, { input: 200, cacheRead: 9_800 }),
+  ], OPTS)
+  assert.ok(v.payload.saved > 0)
+  assert.ok(v.payload.pct > 0)
+  assert.equal(v.xcheck.consistent, true)
+  assert.ok(v.xcheck.ratio >= 0.3 && v.xcheck.ratio <= 3)
+})
+
+test('无臂动作时交叉验证不误报（注入开销不构成矛盾）', () => {
+  clock = 0
+  const v = computeValue([inject(SID, 2000), usage(SID)], OPTS)
+  assert.equal(v.xcheck.ratio, null)
+  assert.equal(v.xcheck.consistent, true)
+})

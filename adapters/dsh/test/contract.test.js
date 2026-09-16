@@ -808,6 +808,7 @@ test('折叠臂 active：指针行替换 + 最新 4 轮保留 + 短消息与插�
   const fold = readMeterEvents(lcmRoot, 'fold')[0]
   assert.equal(fold.mode, 'active')
   assert.equal(fold.nodes, 4)
+  assert.equal(typeof fold.payloadTokens, 'number', 'fold 事件必须带折叠时刻载荷（value 模型 avoided 兜底）')
   // 折叠后重跑：surface 上已是指针行（<200 chars）→ 零可折对象 → 不再重复折叠、
   // 也不记账（无操作不产生噪音事件）
   emitSessionEvent(ctx, session, { type: 'compaction/basic' })

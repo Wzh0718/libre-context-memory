@@ -51,6 +51,43 @@ async function readStdin() {
   return Buffer.concat(chunks).toString('utf8')
 }
 
+/** 多根收集全部 meter 事件：全局根 + 历史散落的全项目根（实测 85% 的事件落在别的根）。 */
+async function collectMeterEvents(cfg) {
+  const { homedir } = await import('node:os')
+  const roots = new Set([cfg.meterDir, cfg.legacyMeterDir].filter(Boolean))
+  const projBase = join(homedir(), 'project')
+  if (existsSync(projBase)) {
+    for (const p of readdirSync(projBase)) {
+      const d = join(projBase, p, '.lcm')
+      if (existsSync(d)) roots.add(d)
+    }
+  }
+  const events = []
+  for (const dir of roots) {
+    for (const n of readdirSync(dir)) {
+      if (!/^meter(-\d{6})?\.jsonl$/.test(n)) continue
+      for (const line of readFileSync(join(dir, n), 'utf8').split('\n')) {
+        if (!line.trim()) continue
+        try { events.push(JSON.parse(line)) } catch { /* 坏行跳过 */ }
+      }
+    }
+  }
+  return events
+}
+
+/** 真实会话集合（provenance 过滤用）：sessionsDir 下存在的 sessionId。 */
+function knownSessionIds(cfg) {
+  const known = new Set()
+  if (cfg.sessionsDir && existsSync(cfg.sessionsDir)) {
+    for (const proj of readdirSync(cfg.sessionsDir)) {
+      try {
+        for (const sid of readdirSync(join(cfg.sessionsDir, proj))) known.add(sid)
+      } catch { /* 非目录跳过 */ }
+    }
+  }
+  return known
+}
+
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2)
   const args = parseArgs(rest)
@@ -206,6 +243,16 @@ async function main() {
       }
     }
     console.log(`回取事件 ${s.retrieveCount} 次（涉及 ${s.retrieveHandles} 个句柄）`)
+    // 价值段（P4）：三行硬账，细节见 lcm value
+    try {
+      const { computeValue } = await import('./value.mjs')
+      const v = computeValue(await collectMeterEvents(cfg), { knownSessions: knownSessionIds(cfg) })
+      if (v.requests > 0) {
+        const M = (n) => Math.abs(n) >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1e3)}k`
+        console.log(`价值记账：净省 ${M(v.net)} = ${(v.netPct * 100).toFixed(1)}%（压缩 ${M(v.realized.compress)} / 剪枝 ${M(v.realized.prune)} / 折叠 ${M(v.realized.fold)} / 注入 −${M(v.injectionCost)}）`
+          + `｜ 避免的击穿 ${M(v.avoidedBust)}｜ 交叉验证 ${v.xcheck.consistent ? '✓' : '✗ 不一致'}（lcm value 详看）`)
+      }
+    } catch { /* 价值段失败不影响 report 主体 */ }
     if (s.memory && (s.memory.stored || s.memory.injects)) {
       const m = s.memory
       console.log(`记忆事件：入库 ${m.stored} ｜ 幂等 ${m.noop} ｜ 禁写 ${m.rejected} ｜ 证伪 ${m.refuted}`
@@ -457,43 +504,14 @@ async function main() {
   }
 
   if (cmd === 'value') {
-    const { homedir } = await import('node:os')
     const { computeValue } = await import('./value.mjs')
-    // 事件落点：全局根 + 历史散落的全项目根（实测 85% 的事件落在别的根）
-    const roots = new Set([cfg.meterDir, cfg.legacyMeterDir].filter(Boolean))
-    const projBase = join(homedir(), 'project')
-    if (existsSync(projBase)) {
-      for (const p of readdirSync(projBase)) {
-        const d = join(projBase, p, '.lcm')
-        if (existsSync(d)) roots.add(d)
-      }
-    }
-    const events = []
-    for (const dir of roots) {
-      for (const n of readdirSync(dir)) {
-        if (!/^meter(-\d{6})?\.jsonl$/.test(n)) continue
-        for (const line of readFileSync(join(dir, n), 'utf8').split('\n')) {
-          if (!line.trim()) continue
-          try { events.push(JSON.parse(line)) } catch { /* 坏行跳过 */ }
-        }
-      }
-    }
+    const events = await collectMeterEvents(cfg)
     // 时间窗：--days N
     const days = args.days ? Number(args.days) : 0
     const since = days > 0 ? Date.now() - days * 86_400_000 : 0
     const windowed = since > 0 ? events.filter((e) => (e.ts ?? 0) >= since) : events
     // provenance：默认只统计 sessionsDir 里真实存在的会话（排除合成/测试数据）；--all 关闭
-    let known = null
-    if (!args.all) {
-      known = new Set()
-      if (cfg.sessionsDir && existsSync(cfg.sessionsDir)) {
-        for (const proj of readdirSync(cfg.sessionsDir)) {
-          try {
-            for (const sid of readdirSync(join(cfg.sessionsDir, proj))) known.add(sid)
-          } catch { /* 非目录跳过 */ }
-        }
-      }
-    }
+    const known = args.all ? null : knownSessionIds(cfg)
     const valueOpts = { knownSessions: known }
     if (args['cache-factor']) valueOpts.cacheFactor = Number(args['cache-factor'])
     const v = computeValue(windowed, valueOpts)
@@ -516,6 +534,9 @@ async function main() {
     console.log(`  避免的击穿（piggyback）${M(v.avoidedBust)}（改写落在冷窗口，省下热窗口整段重发）`)
     if (v.estimated.staticTrimPerRequest > 0) console.log(`  静态裁剪（估算，前缀层）每请求 −${v.estimated.staticTrimPerRequest.toLocaleString()} tok`)
     if (v.cappedRequests > 0) console.log(`  被窗口夹住的请求 ${v.cappedRequests} 个（这部分内容本来也发不出去）`)
+    console.log(`  交叉验证：载荷口径省 ${(v.payload.pct * 100).toFixed(1)}% vs 成本当量 ${(v.netPct * 100).toFixed(1)}%`
+      + `（ratio ${v.xcheck.ratio == null ? '—' : v.xcheck.ratio.toFixed(2)} ∈ [0.3, 3]）`
+      + `${v.xcheck.consistent ? ' ✓ 同向同量级' : ' ✗ 不一致——模型有 bug，勿信此账'}`)
     console.log('  口径：realized 已实现 / avoided 避免 / estimated 估算，三者严格分开。')
     return 0
   }

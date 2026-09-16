@@ -78,6 +78,7 @@ export function computeValue(events, opts = {}) {
   let requests = 0, actualEq = 0, counterfactualEq = 0, cappedRequests = 0
   let injectionCost = 0, avoidedBust = 0
   let injects = 0, injectEntries = 0
+  let payloadActual = 0, payloadSaved = 0   // 载荷口径（不乘档价）——内置交叉验证用
   const freshSaved = { compress: 0, prune: 0, fold: 0 }    // 按 1.0× 计的部分
   const cachedSaved = { compress: 0, prune: 0, fold: 0 }   // 按折价计的部分（成本，已乘档价）
 
@@ -86,20 +87,21 @@ export function computeValue(events, opts = {}) {
     const sessionMaxPayload = Math.max(0, ...usages.map((u) => (u.input ?? 0) + (u.cacheRead ?? 0)))
     const ceiling = Math.max(sessionMaxPayload, hardCeiling)
 
-    // 臂动作（按 ts 序）：S = 省下的 token 数
+    // 臂动作（按 ts 序）：S = 省下的 token 数；保留载荷字段供 avoided 兜底
     const actions = []
     for (const e of arr) {
       if (e.kind === 'prune' || e.kind === 'fold') {
         const S = Math.round(((e.charsBefore ?? 0) - (e.charsAfter ?? 0)) / 2)
-        if (S > 0) actions.push({ ts: e.ts ?? 0, arm: e.kind, S, firstFresh: false })
+        if (S > 0) actions.push({ ts: e.ts ?? 0, arm: e.kind, S, firstFresh: false, payload: e.tokensBefore ?? e.payloadTokens ?? 0 })
       } else if (e.kind === 'compress') {
         const S = Math.round(((e.originalChars ?? 0) - (e.compressedChars ?? 0)) / 2)
-        if (S > 0) actions.push({ ts: e.ts ?? 0, arm: 'compress', S, firstFresh: true })
+        if (S > 0) actions.push({ ts: e.ts ?? 0, arm: 'compress', S, firstFresh: true, payload: e.tokensBefore ?? e.payloadTokens ?? 0 })
       }
     }
     actions.sort((a, b) => a.ts - b.ts)
 
-    // avoidedBust（单列）：每个动作时刻的载荷 = 动作前最近一次 usage 的载荷。
+    // avoidedBust（单列）：每个动作时刻的载荷 = 动作前最近一次 usage 的载荷，
+    // 无前置 usage 时兜底用动作自身记录的载荷（prune.tokensBefore / fold.payloadTokens）。
     // 含义：同样的改写若发生在热窗口，需整段前缀全价重发一次；piggyback 让它落在
     // 冷窗口（缓存本就要重建，边际成本 ≈ 0）——这是「设计避免的损失」，不计入净节省。
     for (const a of actions) {
@@ -108,7 +110,7 @@ export function computeValue(events, opts = {}) {
         if ((u.ts ?? 0) <= a.ts) priorPayload = (u.input ?? 0) + (u.cacheRead ?? 0)
         else break
       }
-      avoidedBust += priorPayload
+      avoidedBust += priorPayload > 0 ? priorPayload : a.payload
     }
 
     // 注入：负项；同会话首次 1.0×、重复折价
@@ -140,6 +142,11 @@ export function computeValue(events, opts = {}) {
       let activeTotal = 0
       for (const a of active) activeTotal += a.S
       if (activeTotal > room) cappedRequests++
+
+      // 载荷口径：同一个 delta 不乘档价——与成本当量口径互为交叉验证（抓定价 bug 的门）
+      const payloadDelta = Math.min(activeTotal, room)
+      payloadActual += payload
+      payloadSaved += payloadDelta
 
       let remaining = room
       let deltaCost = 0
@@ -173,6 +180,17 @@ export function computeValue(events, opts = {}) {
   injectionCost = Math.round(injectionCost)
 
   const net = realized.total - injectionCost
+  const netPct = counterfactualEq > 0 ? net / counterfactualEq : 0
+  // 内置交叉验证：成本当量口径 vs 载荷口径必须同向、同量级。
+  // 首版定价 bug（54.8% vs bench-all 11.9%）就是这道门抓的——ratio 远超 [0.3, 3]。
+  const payloadCounterfactual = payloadActual + payloadSaved
+  const payloadPct = payloadCounterfactual > 0 ? payloadSaved / payloadCounterfactual : 0
+  const ratio = payloadPct > 0.01 ? netPct / payloadPct : null
+  // ratio 为空 = 载荷侧几乎无节省（无臂动作）——此时净额只反映注入开销，不构成矛盾；
+  // ratio 存在时要求非负（两口径同向）且落在带内（同量级）
+  const consistent = ratio == null
+    ? true
+    : netPct >= 0 && ratio >= 0.3 && ratio <= 3
   return {
     sessions: byS.size,
     requests,
@@ -182,11 +200,17 @@ export function computeValue(events, opts = {}) {
     realized,
     injectionCost,
     net,
-    netPct: counterfactualEq > 0 ? net / counterfactualEq : 0,
+    netPct,
     avoidedBust,
     cappedRequests,
     memory: { injects, entries: injectEntries },
     estimated: { staticTrimPerRequest: staticTrimSamples.length > 0 ? Math.round(median(staticTrimSamples)) : 0 },
+    payload: {
+      actual: payloadActual,
+      saved: payloadSaved,
+      pct: payloadPct,
+    },
+    xcheck: { consistent, ratio, band: [0.3, 3] },
     ceiling: {
       global: Math.round(L),
       source: levels.length > 0 ? 'compaction' : 'fallback',

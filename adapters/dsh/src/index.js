@@ -354,7 +354,7 @@ export function apply(ctx, config = {}) {
   // 原纪律保留：seq ≤ 熔炼水位线（信息已在记忆库，折叠=替代而非丢失）；
   // 只在冷窗口调用（piggyback）；最新 foldKeepLastTurns 轮永不折叠（活跃上下文）；
   // 指针行替换走 surfaceOp replace——只改模型可见层，持久日志完好可回放。
-  const runFold = (agent, sessionKey) => {
+  const runFold = (agent, sessionKey, payloadTokens = null) => {
     if (cfg.foldMode === 'off') return
     const session = agent?.session
     if (!session?.surface || typeof session.append !== 'function') return
@@ -409,6 +409,7 @@ export function apply(ctx, config = {}) {
       kind: 'fold', sessionId: sessionKey, mode: cfg.foldMode,
       nodes: folded, charsBefore, charsAfter,
       savedTokens: Math.max(0, Math.ceil((charsBefore - charsAfter) / 2)),
+      payloadTokens,   // 折叠时刻的载荷（value 模型的 avoided 兜底：无前置 usage 时用）
       watermark,
       project: session.header?.cwd ?? null,
     })
@@ -460,7 +461,7 @@ export function apply(ctx, config = {}) {
       }
 
       if (piggybackOk) {
-        try { runFold(agent, sessionKey) } catch (error) {
+        try { runFold(agent, sessionKey, measurement.totalTokens) } catch (error) {
           ctx.logger.warn(`dsh-lcm: fold failed: ${String(error?.message ?? error)}; continuing`)
         }
       }
